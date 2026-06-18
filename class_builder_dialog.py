@@ -21,13 +21,18 @@ def get_app_icon():
 # DATABASE INITIALIZATION
 # ==========================================
 def init_db(db_path=DB_NAME):
+    """
+    Creates the foundational database tables if they do not exist.
+    This schema powers the entire meta-architecture of the Nexus app.
+    """
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = 1")
+    conn.execute("PRAGMA foreign_keys = 1") # Enforces cascading deletes
     cursor = conn.cursor()
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS classes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
+            name TEXT NOT NULL UNIQUE,
+            path TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS attributes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +40,10 @@ def init_db(db_path=DB_NAME):
             name TEXT NOT NULL,
             data_type TEXT NOT NULL,
             row_order INTEGER DEFAULT 0,
+            show_in_table INTEGER DEFAULT 1,
+            is_title INTEGER DEFAULT 0,
+            is_unique INTEGER DEFAULT 0,
+            is_required INTEGER DEFAULT 0,
             FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS matrix_columns (
@@ -50,38 +59,27 @@ def init_db(db_path=DB_NAME):
             target_class INTEGER,
             rel_type TEXT NOT NULL,
             row_order INTEGER DEFAULT 0,
+            show_in_table INTEGER DEFAULT 1,
             FOREIGN KEY(source_class) REFERENCES classes(id) ON DELETE CASCADE,
             FOREIGN KEY(target_class) REFERENCES classes(id) ON DELETE CASCADE
         );
     """)
-    
-    # MIGRATIONS: Add new columns if updating an existing database
-    try: cursor.execute("ALTER TABLE attributes ADD COLUMN show_in_table INTEGER DEFAULT 1")
-    except sqlite3.OperationalError: pass
-    
-    try: cursor.execute("ALTER TABLE attributes ADD COLUMN is_title INTEGER DEFAULT 0")
-    except sqlite3.OperationalError: pass
-    
-    try: cursor.execute("ALTER TABLE classes ADD COLUMN path TEXT DEFAULT ''")
-    except sqlite3.OperationalError: pass
-
-    # NEW MIGRATION: Show in table for relationships
-    try: cursor.execute("ALTER TABLE relationships ADD COLUMN show_in_table INTEGER DEFAULT 1")
-    except sqlite3.OperationalError: pass
-
     conn.commit()
     return conn
 
 
 class ReorderableRow(QWidget):
+    """Base class providing Up/Down arrow functionality for UI rows."""
     def __init__(self, parent_layout):
         super().__init__()
         self.parent_layout = parent_layout
+        
     def move_up(self):
         idx = self.parent_layout.indexOf(self)
         if idx > 0:
             self.parent_layout.takeAt(idx)
             self.parent_layout.insertWidget(idx - 1, self)
+            
     def move_down(self):
         idx = self.parent_layout.indexOf(self)
         if idx < self.parent_layout.count() - 1:
@@ -89,6 +87,7 @@ class ReorderableRow(QWidget):
             self.parent_layout.insertWidget(idx + 1, self)
 
 class AttributeRow(ReorderableRow):
+    """UI Widget representing a single attribute inside the Class Builder."""
     def __init__(self, parent_layout, button_group, attr_data=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
@@ -96,52 +95,68 @@ class AttributeRow(ReorderableRow):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_up = QPushButton("▲")
+        # Reordering Buttons
+        self.btn_up = QPushButton("\u25B2") # Unicode Up Arrow
         self.btn_up.setFixedWidth(25)
         self.btn_up.clicked.connect(self.move_up)
         
-        self.btn_down = QPushButton("▼")
+        self.btn_down = QPushButton("\u25BC") # Unicode Down Arrow
         self.btn_down.setFixedWidth(25)
         self.btn_down.clicked.connect(self.move_down)
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Attribute Name")
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["int", "float", "string", "long string", "list", "matrix"])
         
+        # Data Type Selection (Added 'date' and 'boolean')
+        self.type_combo = QComboBox()
+        self.type_combo.addItems([
+            "int", "float", "string", "long string", "date", "boolean", "list", "matrix"
+        ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
-        self.matrix_btn = QPushButton("Set Matrix Cols")
-        self.matrix_btn.setVisible(False)
-        self.matrix_btn.clicked.connect(self.set_matrix_columns)
-
-        self.show_cb = QCheckBox("Show in Table")
+        
+        # Constraints and UI preferences
+        self.show_cb = QCheckBox("Show")
         self.show_cb.setChecked(True)
         
-        self.title_rb = QRadioButton("Use as Title")
+        self.title_rb = QRadioButton("Title")
         button_group.addButton(self.title_rb)
+        
+        self.unique_cb = QCheckBox("Unique")
+        self.req_cb = QCheckBox("Req.")
+
+        self.matrix_btn = QPushButton("Set Cols")
+        self.matrix_btn.setVisible(False)
+        self.matrix_btn.clicked.connect(self.set_matrix_columns)
 
         self.delete_btn = QPushButton("X")
         self.delete_btn.setFixedWidth(30)
         self.delete_btn.clicked.connect(self.deleteLater)
 
+        # Assemble layout
         layout.addWidget(self.btn_up)
         layout.addWidget(self.btn_down)
         layout.addWidget(self.name_input)
         layout.addWidget(self.type_combo)
         layout.addWidget(self.show_cb)
         layout.addWidget(self.title_rb)
+        layout.addWidget(self.unique_cb)
+        layout.addWidget(self.req_cb)
         layout.addWidget(self.matrix_btn)
         layout.addWidget(self.delete_btn)
 
+        # Pre-fill if editing an existing class
         if attr_data:
             self.name_input.setText(attr_data['name'])
             self.type_combo.setCurrentText(attr_data['type'])
             self.show_cb.setChecked(bool(attr_data.get('show_in_table', 1)))
             self.title_rb.setChecked(bool(attr_data.get('is_title', 0)))
+            self.unique_cb.setChecked(bool(attr_data.get('is_unique', 0)))
+            self.req_cb.setChecked(bool(attr_data.get('is_required', 0)))
             self.matrix_cols = attr_data.get('matrix_cols', [])
             self.on_type_changed(attr_data['type'])
 
     def on_type_changed(self, text):
+        # Only show the "Set Cols" button if the user selected matrix
         self.matrix_btn.setVisible(text == "matrix")
 
     def set_matrix_columns(self):
@@ -156,16 +171,17 @@ class AttributeRow(ReorderableRow):
 
 
 class RelationshipRow(ReorderableRow):
+    """UI Widget representing an outgoing relationship link to another class."""
     def __init__(self, parent_layout, valid_classes, rel_data=None):
         super().__init__(parent_layout)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_up = QPushButton("▲")
+        self.btn_up = QPushButton("\u25B2") 
         self.btn_up.setFixedWidth(25)
         self.btn_up.clicked.connect(self.move_up)
         
-        self.btn_down = QPushButton("▼")
+        self.btn_down = QPushButton("\u25BC") 
         self.btn_down.setFixedWidth(25)
         self.btn_down.clicked.connect(self.move_down)
 
@@ -176,7 +192,6 @@ class RelationshipRow(ReorderableRow):
         self.type_combo = QComboBox()
         self.type_combo.addItems(["one_to_many", "many_to_many"])
         
-        # NEW: Checkbox for relationships
         self.show_cb = QCheckBox("Show in Table")
         self.show_cb.setChecked(True)
         
@@ -201,6 +216,7 @@ class RelationshipRow(ReorderableRow):
 
 
 class ClassBuilderDialog(QDialog):
+    """The main dialog window for constructing and modifying database schemas."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nexus - Class Builder")
@@ -219,7 +235,7 @@ class ClassBuilderDialog(QDialog):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Left Widget (Tree structure)
+        # LEFT WIDGET: Tree Directory
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         self.class_list_widget = QTreeWidget()
@@ -232,7 +248,7 @@ class ClassBuilderDialog(QDialog):
         left_layout.addWidget(self.class_list_widget)
         left_layout.addWidget(btn_add)
 
-        # Right Widget (Editor)
+        # RIGHT WIDGET: Class Editor
         self.editor_widget = QWidget()
         self.editor_layout = QVBoxLayout(self.editor_widget)
         self.editor_widget.setEnabled(False)
@@ -297,11 +313,11 @@ class ClassBuilderDialog(QDialog):
         
     def get_all_classes(self):
         cur = self.db.cursor()
-        # Returns id, name, and path
         cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
         return cur.fetchall()
 
     def refresh_class_list(self):
+        """Builds the visual tree in the left sidebar based on paths."""
         self.class_list_widget.clear()
         
         root_items = {}
@@ -319,20 +335,19 @@ class ClassBuilderDialog(QDialog):
                     current_path = f"{current_path}/{part}" if current_path else part
                     
                     if current_path not in root_items:
-                        folder_item = QTreeWidgetItem([f"📁 {part}"])
+                        folder_item = QTreeWidgetItem([f"\U0001F4C1 {part}"])
                         current_parent.addChild(folder_item)
                         root_items[current_path] = folder_item
                     
                     current_parent = root_items[current_path]
             
-            item = QTreeWidgetItem([f"📄 {cname}"])
+            item = QTreeWidgetItem([f"\U0001F4C4 {cname}"])
             item.setData(0, Qt.UserRole, cid)
             current_parent.addChild(item)
             
         self.class_list_widget.expandAll()
 
     def add_rel_row(self):
-        # We extract only (id, name) for relationship dropdowns
         valid = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
         self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid))
 
@@ -343,7 +358,6 @@ class ClassBuilderDialog(QDialog):
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
         
-        # Reset button group
         for btn in self.title_button_group.buttons():
             self.title_button_group.removeButton(btn)
             
@@ -357,14 +371,13 @@ class ClassBuilderDialog(QDialog):
     def load_class(self, item, column=0):
         cid = item.data(0, Qt.UserRole)
         if not cid: 
-            return # User clicked a folder, ignore
+            return 
             
         self.current_class_id = cid
         self.editor_widget.setEnabled(True)
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
 
-        # Clear button group connections
         for btn in self.title_button_group.buttons():
             self.title_button_group.removeButton(btn)
 
@@ -374,10 +387,9 @@ class ClassBuilderDialog(QDialog):
         self.class_name_input.setText(row[0])
         self.class_path_input.setText(row[1] if row[1] else "")
 
-        # Load Attributes
-        cur.execute("SELECT id, name, data_type, show_in_table, is_title FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
+        cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
         attributes = cur.fetchall()
-        for attr_id, attr_name, attr_type, show_in_table, is_title in attributes:
+        for attr_id, attr_name, attr_type, show_in_table, is_title, is_unique, is_required in attributes:
             matrix_cols = []
             if attr_type == "matrix":
                 cur.execute("SELECT column_name FROM matrix_columns WHERE attribute_id = ? ORDER BY column_index", (attr_id,))
@@ -388,22 +400,39 @@ class ClassBuilderDialog(QDialog):
                 'type': attr_type, 
                 'matrix_cols': matrix_cols,
                 'show_in_table': show_in_table,
-                'is_title': is_title
+                'is_title': is_title,
+                'is_unique': is_unique,
+                'is_required': is_required
             }
             self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.title_button_group, attr_data))
 
-        # Load Relationships (now pulling show_in_table)
         cur.execute("SELECT target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
         for target, rel_type, show_in_table in cur.fetchall():
             valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
             self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'target_class': target, 'type': rel_type, 'show_in_table': show_in_table}))
 
     def save_class(self):
+        """Saves the class and its attributes into the meta-schema tables."""
         name = self.class_name_input.text().strip()
         path_val = self.class_path_input.text().strip()
         if not name:
             QMessageBox.warning(self, "Error", "Class name cannot be empty.")
             return
+
+        # ENFORCEMENT: Attribute names must be unique within a class.
+        attr_names = set()
+        for i in range(self.attributes_layout.count()):
+            widget = self.attributes_layout.itemAt(i).widget()
+            if isinstance(widget, AttributeRow):
+                attr_name = widget.name_input.text().strip()
+                if not attr_name: continue
+                
+                # Normalize name: "My Name" and "my_name" map to the same SQL column
+                safe_name = attr_name.replace(' ', '_').lower()
+                if safe_name in attr_names:
+                    QMessageBox.warning(self, "Error", f"Duplicate attribute detected: '{attr_name}'. Attribute names must be unique.")
+                    return
+                attr_names.add(safe_name)
 
         cur = self.db.cursor()
         try:
@@ -413,6 +442,7 @@ class ClassBuilderDialog(QDialog):
             else:
                 cur.execute("UPDATE classes SET name = ?, path = ? WHERE id = ?", (name, path_val, self.current_class_id))
             
+            # Wiping old schema rules and rebuilding them fresh ensures perfect sync
             cur.execute("DELETE FROM attributes WHERE class_id = ?", (self.current_class_id,))
             cur.execute("DELETE FROM relationships WHERE source_class = ?", (self.current_class_id,))
 
@@ -425,11 +455,13 @@ class ClassBuilderDialog(QDialog):
                     
                     show_in_table = 1 if widget.show_cb.isChecked() else 0
                     is_title = 1 if widget.title_rb.isChecked() else 0
+                    is_unique = 1 if widget.unique_cb.isChecked() else 0
+                    is_required = 1 if widget.req_cb.isChecked() else 0
                     
                     cur.execute("""
-                        INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title) 
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title))
+                        INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required))
                     new_attr_id = cur.lastrowid
 
                     if attr_type == "matrix":
