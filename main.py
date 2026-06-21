@@ -4,12 +4,20 @@ import os
 import csv
 import ast
 import datetime
+import traceback
+from contextlib import redirect_stdout, redirect_stderr
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QTableView, 
     QHeaderView, QMessageBox, QFileDialog, QListWidget, QListWidgetItem, QDialog,
     QSplitter, QScrollArea, QComboBox, QInputDialog, QFormLayout, QSpinBox, 
-    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox
+    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit
 )
 from PySide6.QtCore import Qt, QSettings, QDateTime
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
@@ -641,6 +649,22 @@ class SettingsDialog(QDialog):
         path_layout.addWidget(btn_browse)
         layout.addLayout(path_layout)
 
+        # --- NEW: Module Output Path ---
+        layout.addWidget(QLabel("Module Output File Path:"))
+        
+        out_layout = QHBoxLayout()
+        self.output_input = QLineEdit()
+        default_out = os.path.join(os.path.expanduser("~"), "module_output.txt")
+        self.output_input.setText(self.settings.value("module_output_path", default_out))
+        
+        btn_browse_out = QPushButton("Browse...")
+        btn_browse_out.clicked.connect(self.browse_output_file)
+        
+        out_layout.addWidget(self.output_input)
+        out_layout.addWidget(btn_browse_out)
+        layout.addLayout(out_layout)
+        # -------------------------------
+
         layout.addStretch()
 
         btn_save = QPushButton("Save && Connect")
@@ -657,6 +681,11 @@ class SettingsDialog(QDialog):
         if file_name:
             self.path_input.setText(file_name)
 
+    def browse_output_file(self):
+        file_name, _ = QFileDialog.getSaveFileName(self, "Select Output File", "", "Text Files (*.txt)")
+        if file_name:
+            self.output_input.setText(file_name)
+
     def save_and_check_db(self):
         path = self.path_input.text().strip()
         if not path: return
@@ -665,8 +694,100 @@ class SettingsDialog(QDialog):
             init_db(path)
 
         self.settings.setValue("db_path", path)
+        self.settings.setValue("module_output_path", self.output_input.text().strip())
         QMessageBox.information(self, "Success", "Database connected and set as default.")
         self.accept() 
+
+
+class ModuleBuilderDialog(QDialog):
+    def __init__(self, db_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Module Builder")
+        self.setWindowIcon(get_app_icon())
+        self.resize(800, 600)
+        self.db_path = db_path
+        
+        if pd is None:
+            QMessageBox.warning(self, "Missing Library", "The 'pandas' library is required to use the Module Builder and return DataFrames.\n\nPlease install it via terminal: pip install pandas")
+        
+        layout = QVBoxLayout(self)
+        
+        self.editor = QPlainTextEdit()
+        font = self.editor.font()
+        font.setFamily("Courier New")
+        font.setPointSize(11)
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        
+        placeholder = (
+            "# Write your Python script here.\n"
+            "# Built-in Helper API:\n"
+            "#   df = get_objects('ClassName') -> Returns a pandas DataFrame of the class view.\n\n"
+            "print('Hello from Module Builder!')\n"
+        )
+        self.editor.setPlainText(placeholder)
+        
+        layout.addWidget(QLabel("Python Script Editor:"))
+        layout.addWidget(self.editor)
+        
+        btn_layout = QHBoxLayout()
+        btn_run = QPushButton("\u25B6 Run Script")
+        btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
+        btn_run.clicked.connect(self.run_script)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_run)
+        layout.addLayout(btn_layout)
+
+    def get_objects(self, class_name):
+        """Helper API to fetch the full SQL view of a class as a DataFrame."""
+        if pd is None:
+            raise ImportError("Pandas library is not installed.")
+            
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM classes WHERE name = ?", (class_name,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"Class '{class_name}' not found in the database.")
+        cls_id = row[0]
+        conn.close()
+        
+        # Ensure the view exists and is perfectly up to date before querying
+        view_name, _ = sync_physical_table(self.db_path, cls_id, class_name, parent_widget=None)
+        if not view_name:
+            raise RuntimeError(f"Failed to sync schema for class '{class_name}'.")
+            
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query(f"SELECT * FROM {view_name}", conn)
+        conn.close()
+        return df
+
+    def run_script(self):
+        code = self.editor.toPlainText()
+        settings = QSettings("MyCompany", "DatabaseManagerApp")
+        out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
+        
+        # Define the execution context containing our custom API
+        context = {
+            'get_objects': self.get_objects,
+            'pd': pd  # Safely provide pandas so they don't have to import it
+        }
+        
+        try:
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(f"--- Script Executed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
+                # Redirect print() statements directly to the text file
+                with redirect_stdout(f), redirect_stderr(f):
+                    exec(code, context)
+            QMessageBox.information(self, "Success", f"Script executed successfully.\nOutput saved to:\n{out_path}")
+        except Exception as e:
+            # If the script crashes, append the traceback to the file so they can debug it
+            with open(out_path, 'a', encoding='utf-8') as f:
+                f.write("\n\n--- RUNTIME ERROR ---\n")
+                traceback.print_exc(file=f)
+            QMessageBox.warning(self, "Script Error", f"An error occurred during execution.\nCheck the output file for details:\n{out_path}")
 
 
 class DataBrowserPage(QWidget):
@@ -1220,6 +1341,15 @@ class MainWindow(QMainWindow):
         action_builder = QAction("\U0001F6E0\uFE0F Class Builder", self)
         action_builder.triggered.connect(self.open_builder)
         db_menu.addAction(action_builder)
+        
+        action_module = QAction("\U0001F4BB Module Builder", self)
+        action_module.triggered.connect(self.open_module_builder)
+        db_menu.addAction(action_module)
+
+        doc_menu = menubar.addMenu("Documentation")
+        action_api = QAction("\U0001F4D6 Module API", self)
+        action_api.triggered.connect(self.open_module_api)
+        doc_menu.addAction(action_api)
 
     def open_settings(self):
         dialog = SettingsDialog(self)
@@ -1230,6 +1360,17 @@ class MainWindow(QMainWindow):
         dialog = ClassBuilderDialog(self)
         dialog.exec()
         self.refresh_sidebar() 
+
+    def open_module_builder(self):
+        db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+        if not db_path or not os.path.exists(db_path):
+            QMessageBox.warning(self, "No Database", "Please connect to a database first via Settings.")
+            return
+        dialog = ModuleBuilderDialog(db_path, self)
+        dialog.exec()
+        
+    def open_module_api(self):
+        QMessageBox.information(self, "Module API", "Documentation coming soon...\n\nCurrently available built-in functions:\n\nget_objects(class_name)\n-> Returns a complete Pandas DataFrame of the specified class, including automatically resolved multi-title relationships.")
 
     def refresh_sidebar(self):
         self.sidebar.clear()
