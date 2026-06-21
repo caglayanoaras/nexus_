@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QTableView, 
     QHeaderView, QMessageBox, QFileDialog, QListWidget, QListWidgetItem, QDialog,
     QSplitter, QScrollArea, QComboBox, QInputDialog, QFormLayout, QSpinBox, 
-    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit
+    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit, QTabWidget
 )
 from PySide6.QtCore import Qt, QSettings, QDateTime
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
@@ -631,12 +631,17 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Database Settings")
         self.setWindowIcon(get_app_icon())
-        self.resize(500, 150)
+        self.resize(500, 250)
         self.settings = QSettings("MyCompany", "DatabaseManagerApp")
         
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
         
-        layout.addWidget(QLabel("Database Path:"))
+        # --- Database Tab ---
+        db_tab = QWidget()
+        db_layout = QVBoxLayout(db_tab)
+        db_layout.addWidget(QLabel("Database Path:"))
 
         path_layout = QHBoxLayout()
         self.path_input = QLineEdit()
@@ -647,14 +652,25 @@ class SettingsDialog(QDialog):
         
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(btn_browse)
-        layout.addLayout(path_layout)
+        db_layout.addLayout(path_layout)
+        db_layout.addStretch()
+        self.tabs.addTab(db_tab, "Database")
 
-        # --- NEW: Module Output Path ---
-        layout.addWidget(QLabel("Module Output File Path:"))
+        # --- Modules Tab ---
+        mod_tab = QWidget()
+        mod_layout = QVBoxLayout(mod_tab)
+        mod_layout.addWidget(QLabel("Module Output File Path:"))
         
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit()
-        default_out = os.path.join(os.path.expanduser("~"), "module_output.txt")
+        
+        db_path = self.settings.value("db_path", "")
+        # Dynamically set default path to exactly where the database is
+        if db_path and os.path.exists(os.path.dirname(db_path)):
+            default_out = os.path.join(os.path.dirname(db_path), "module_output.txt")
+        else:
+            default_out = os.path.join(os.path.expanduser("~"), "module_output.txt")
+            
         self.output_input.setText(self.settings.value("module_output_path", default_out))
         
         btn_browse_out = QPushButton("Browse...")
@@ -662,19 +678,17 @@ class SettingsDialog(QDialog):
         
         out_layout.addWidget(self.output_input)
         out_layout.addWidget(btn_browse_out)
-        layout.addLayout(out_layout)
-        # -------------------------------
+        mod_layout.addLayout(out_layout)
+        mod_layout.addStretch()
+        self.tabs.addTab(mod_tab, "Modules")
 
-        layout.addStretch()
-
-        btn_save = QPushButton("Save && Connect")
-        btn_save.clicked.connect(self.save_and_check_db)
-        
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        btn_save = QPushButton("Save && Connect")
+        btn_save.clicked.connect(self.save_and_check_db)
         btn_layout.addWidget(btn_save)
         
-        layout.addLayout(btn_layout)
+        main_layout.addLayout(btn_layout)
 
     def browse_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Select SQLite Database", "", "SQLite DB (*.db *.sqlite)")
@@ -704,14 +718,48 @@ class ModuleBuilderDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Module Builder")
         self.setWindowIcon(get_app_icon())
-        self.resize(800, 600)
+        self.resize(1000, 700)
         self.db_path = db_path
+        self.current_module_id = None
         
         if pd is None:
             QMessageBox.warning(self, "Missing Library", "The 'pandas' library is required to use the Module Builder and return DataFrames.\n\nPlease install it via terminal: pip install pandas")
         
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
         
+        # LEFT WIDGET: Tree Directory
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        self.module_list_widget = QTreeWidget()
+        self.module_list_widget.setHeaderHidden(True)
+        self.module_list_widget.itemClicked.connect(self.load_module)
+        
+        btn_add = QPushButton("+ Create New Module")
+        btn_add.clicked.connect(self.create_new_module)
+        left_layout.addWidget(QLabel("<b>Saved Modules</b>"))
+        left_layout.addWidget(self.module_list_widget)
+        left_layout.addWidget(btn_add)
+        
+        # RIGHT WIDGET: Module Editor
+        self.editor_widget = QWidget()
+        self.editor_layout = QVBoxLayout(self.editor_widget)
+        self.editor_widget.setEnabled(False)
+        
+        # Info row
+        info_layout = QHBoxLayout()
+        self.module_name_input = QLineEdit()
+        self.module_name_input.setPlaceholderText("Module Name")
+        self.module_path_input = QLineEdit()
+        self.module_path_input.setPlaceholderText("e.g. Reports/Inventory")
+        info_layout.addWidget(QLabel("Name:"))
+        info_layout.addWidget(self.module_name_input)
+        info_layout.addWidget(QLabel("Path:"))
+        info_layout.addWidget(self.module_path_input)
+        self.editor_layout.addLayout(info_layout)
+        
+        # Editor
         self.editor = QPlainTextEdit()
         font = self.editor.font()
         font.setFamily("Courier New")
@@ -719,6 +767,86 @@ class ModuleBuilderDialog(QDialog):
         font.setStyleHint(QFont.Monospace)
         self.editor.setFont(font)
         
+        self.editor_layout.addWidget(QLabel("Python Script Editor:"))
+        self.editor_layout.addWidget(self.editor)
+        
+        # Bottom Buttons
+        btn_layout = QHBoxLayout()
+        
+        btn_delete = QPushButton("Delete Module")
+        btn_delete.setStyleSheet("background-color: #ff4c4c; color: white;")
+        btn_delete.clicked.connect(self.delete_module)
+        
+        btn_save = QPushButton("\U0001F4BE Save Module")
+        btn_save.clicked.connect(self.save_module)
+        
+        btn_run = QPushButton("\u25B6 Run Script")
+        btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px 15px;")
+        btn_run.clicked.connect(self.run_script)
+        
+        btn_layout.addWidget(btn_delete)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_run)
+        self.editor_layout.addLayout(btn_layout)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(self.editor_widget)
+        splitter.setSizes([250, 750])
+        
+        self.refresh_module_list()
+
+    def get_all_modules(self):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        # Ensure modules table exists in case init_db wasn't triggered manually on old db files
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT DEFAULT '',
+                code TEXT DEFAULT ''
+            )
+        """)
+        conn.commit()
+        cur.execute("SELECT id, name, path FROM modules ORDER BY path ASC, name ASC")
+        res = cur.fetchall()
+        conn.close()
+        return res
+
+    def refresh_module_list(self):
+        self.module_list_widget.clear()
+        root_items = {}
+        parent_item = self.module_list_widget.invisibleRootItem()
+        
+        for mid, mname, mpath in self.get_all_modules():
+            mpath = (mpath or "").strip().strip('/')
+            current_parent = parent_item
+            
+            if mpath:
+                current_path = ""
+                for part in mpath.split('/'):
+                    part = part.strip()
+                    if not part: continue
+                    current_path = f"{current_path}/{part}" if current_path else part
+                    
+                    if current_path not in root_items:
+                        folder_item = QTreeWidgetItem([f"\U0001F4C1 {part}"])
+                        current_parent.addChild(folder_item)
+                        root_items[current_path] = folder_item
+                    
+                    current_parent = root_items[current_path]
+            
+            item = QTreeWidgetItem([f"\U0001F4BB {mname}"])
+            item.setData(0, Qt.UserRole, mid)
+            current_parent.addChild(item)
+            
+        self.module_list_widget.expandAll()
+
+    def create_new_module(self):
+        self.current_module_id = None
+        self.module_name_input.clear()
+        self.module_path_input.clear()
         placeholder = (
             "# Write your Python script here.\n"
             "# Built-in Helper API:\n"
@@ -726,18 +854,74 @@ class ModuleBuilderDialog(QDialog):
             "print('Hello from Module Builder!')\n"
         )
         self.editor.setPlainText(placeholder)
+        self.editor_widget.setEnabled(True)
+
+    def load_module(self, item, column=0):
+        mid = item.data(0, Qt.UserRole)
+        if not mid: return
         
-        layout.addWidget(QLabel("Python Script Editor:"))
-        layout.addWidget(self.editor)
+        self.current_module_id = mid
+        self.editor_widget.setEnabled(True)
         
-        btn_layout = QHBoxLayout()
-        btn_run = QPushButton("\u25B6 Run Script")
-        btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px;")
-        btn_run.clicked.connect(self.run_script)
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT name, path, code FROM modules WHERE id = ?", (mid,))
+        row = cur.fetchone()
+        conn.close()
         
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_run)
-        layout.addLayout(btn_layout)
+        if row:
+            self.module_name_input.setText(row[0])
+            self.module_path_input.setText(row[1] if row[1] else "")
+            self.editor.setPlainText(row[2] if row[2] else "")
+
+    def save_module(self):
+        name = self.module_name_input.text().strip()
+        path_val = self.module_path_input.text().strip()
+        code = self.editor.toPlainText()
+        
+        if not name:
+            QMessageBox.warning(self, "Error", "Module name cannot be empty.")
+            return
+            
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        # Fallback table check incase init_db was skipped
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT DEFAULT '',
+                code TEXT DEFAULT ''
+            )
+        """)
+        try:
+            if self.current_module_id is None:
+                cur.execute("INSERT INTO modules (name, path, code) VALUES (?, ?, ?)", (name, path_val, code))
+                self.current_module_id = cur.lastrowid
+            else:
+                cur.execute("UPDATE modules SET name = ?, path = ?, code = ? WHERE id = ?", (name, path_val, code, self.current_module_id))
+            conn.commit()
+            self.refresh_module_list()
+            QMessageBox.information(self, "Success", "Module saved successfully!")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Error", "A module with this name already exists.")
+        finally:
+            conn.close()
+
+    def delete_module(self):
+        if self.current_module_id is None: return
+        reply = QMessageBox.question(self, "Delete", "Are you sure you want to delete this module?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("DELETE FROM modules WHERE id = ?", (self.current_module_id,))
+            conn.commit()
+            conn.close()
+            self.current_module_id = None
+            self.editor_widget.setEnabled(False)
+            self.module_name_input.clear()
+            self.module_path_input.clear()
+            self.editor.clear()
+            self.refresh_module_list()
 
     def get_objects(self, class_name):
         """Helper API to fetch the full SQL view of a class as a DataFrame."""

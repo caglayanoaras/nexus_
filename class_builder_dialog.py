@@ -63,6 +63,12 @@ def init_db(db_path=DB_NAME):
             FOREIGN KEY(source_class) REFERENCES classes(id) ON DELETE CASCADE,
             FOREIGN KEY(target_class) REFERENCES classes(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS modules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            path TEXT DEFAULT '',
+            code TEXT DEFAULT ''
+        );
     """)
     conn.commit()
     return conn
