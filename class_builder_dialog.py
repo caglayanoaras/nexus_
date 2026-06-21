@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QListWidget, QPushButton, QLineEdit, QLabel, QTableView, 
     QHeaderView, QMessageBox, QFileDialog, QListWidgetItem, QDialog,
     QSplitter, QScrollArea, QComboBox, QInputDialog, QCheckBox,
-    QRadioButton, QButtonGroup, QTreeWidget, QTreeWidgetItem
+    QTreeWidget, QTreeWidgetItem
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, QSettings
@@ -88,7 +88,7 @@ class ReorderableRow(QWidget):
 
 class AttributeRow(ReorderableRow):
     """UI Widget representing a single attribute inside the Class Builder."""
-    def __init__(self, parent_layout, button_group, attr_data=None):
+    def __init__(self, parent_layout, attr_data=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
         
@@ -107,7 +107,7 @@ class AttributeRow(ReorderableRow):
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Attribute Name")
         
-        # Data Type Selection (Added 'date' and 'boolean')
+        # Data Type Selection
         self.type_combo = QComboBox()
         self.type_combo.addItems([
             "int", "float", "string", "long string", "date", "boolean", "list", "matrix"
@@ -118,8 +118,7 @@ class AttributeRow(ReorderableRow):
         self.show_cb = QCheckBox("Show")
         self.show_cb.setChecked(True)
         
-        self.title_rb = QRadioButton("Title")
-        button_group.addButton(self.title_rb)
+        self.title_cb = QCheckBox("Title")
         
         self.unique_cb = QCheckBox("Unique")
         self.req_cb = QCheckBox("Req.")
@@ -138,7 +137,7 @@ class AttributeRow(ReorderableRow):
         layout.addWidget(self.name_input)
         layout.addWidget(self.type_combo)
         layout.addWidget(self.show_cb)
-        layout.addWidget(self.title_rb)
+        layout.addWidget(self.title_cb)
         layout.addWidget(self.unique_cb)
         layout.addWidget(self.req_cb)
         layout.addWidget(self.matrix_btn)
@@ -149,7 +148,7 @@ class AttributeRow(ReorderableRow):
             self.name_input.setText(attr_data['name'])
             self.type_combo.setCurrentText(attr_data['type'])
             self.show_cb.setChecked(bool(attr_data.get('show_in_table', 1)))
-            self.title_rb.setChecked(bool(attr_data.get('is_title', 0)))
+            self.title_cb.setChecked(bool(attr_data.get('is_title', 0)))
             self.unique_cb.setChecked(bool(attr_data.get('is_unique', 0)))
             self.req_cb.setChecked(bool(attr_data.get('is_required', 0)))
             self.matrix_cols = attr_data.get('matrix_cols', [])
@@ -276,9 +275,6 @@ class ClassBuilderDialog(QDialog):
         self.attributes_layout = QVBoxLayout()
         self.relationships_layout = QVBoxLayout()
         
-        # Enforces that only ONE attribute can be the Title per class
-        self.title_button_group = QButtonGroup(self)
-
         self.scroll_layout.addWidget(QLabel("<b>Attributes</b>"))
         self.scroll_layout.addLayout(self.attributes_layout)
         self.scroll_layout.addWidget(QLabel("<b>Relationships</b>"))
@@ -286,7 +282,7 @@ class ClassBuilderDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_attr = QPushButton("+ Add Attribute")
-        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.title_button_group)))
+        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout)))
         btn_rel = QPushButton("+ Add Relationship")
         btn_rel.clicked.connect(self.add_rel_row)
         btn_layout.addWidget(btn_attr)
@@ -357,9 +353,6 @@ class ClassBuilderDialog(QDialog):
         self.class_path_input.clear()
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
-        
-        for btn in self.title_button_group.buttons():
-            self.title_button_group.removeButton(btn)
             
         self.editor_widget.setEnabled(True)
 
@@ -377,9 +370,6 @@ class ClassBuilderDialog(QDialog):
         self.editor_widget.setEnabled(True)
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
-
-        for btn in self.title_button_group.buttons():
-            self.title_button_group.removeButton(btn)
 
         cur = self.db.cursor()
         cur.execute("SELECT name, path FROM classes WHERE id = ?", (self.current_class_id,))
@@ -404,7 +394,7 @@ class ClassBuilderDialog(QDialog):
                 'is_unique': is_unique,
                 'is_required': is_required
             }
-            self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.title_button_group, attr_data))
+            self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, attr_data))
 
         cur.execute("SELECT target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
         for target, rel_type, show_in_table in cur.fetchall():
@@ -454,7 +444,7 @@ class ClassBuilderDialog(QDialog):
                     if not attr_name: continue
                     
                     show_in_table = 1 if widget.show_cb.isChecked() else 0
-                    is_title = 1 if widget.title_rb.isChecked() else 0
+                    is_title = 1 if widget.title_cb.isChecked() else 0
                     is_unique = 1 if widget.unique_cb.isChecked() else 0
                     is_required = 1 if widget.req_cb.isChecked() else 0
                     

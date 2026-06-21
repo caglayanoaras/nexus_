@@ -45,7 +45,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         safe_col_name = attr_name.replace(' ', '_').lower()
         
         # MAP APP DATA TYPES TO SQLITE DATA TYPES
-        # Booleans are stored as integers (0 or 1). Dates and Lists are stored as TEXT.
         if attr_type in ("int", "boolean"):
             sql_type = "INTEGER"
         elif attr_type == "float":
@@ -57,7 +56,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         attr_app_types[safe_col_name] = attr_type
         
         if show_in_table:
-            # We wrap everything in [] to prevent SQL Keyword crashes (e.g. naming a column 'AS' or 'WHERE')
             select_clause.append(f"m.[{safe_col_name}] AS [{attr_name}]")
 
     # 2. CREATE OR UPDATE PRIMARY TABLE
@@ -79,8 +77,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 type_mismatches.append(col_name)
                 
         if type_mismatches:
-            # If the admin changed a column type (e.g. from String to Int), 
-            # we must test if the existing data survives the conversion.
             type_mismatches_escaped = ", ".join([f"[{c}]" for c in type_mismatches])
             cur.execute(f"SELECT id, {type_mismatches_escaped} FROM {safe_table_name}")
             rows = cur.fetchall()
@@ -119,8 +115,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                         conn.close()
                         return None, None
                         
-            # SAFE SCHEMA REBUILD: Since SQLite doesn't let you easily change a column's type via ALTER TABLE,
-            # we build a temporary table, copy data over, drop the old table, and rename the new one.
             conn.commit()
             conn.execute("PRAGMA foreign_keys = OFF")
             
@@ -177,7 +171,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             conn.execute("PRAGMA foreign_keys = ON")
             
         else:
-            # If no types mismatched, just safely add any brand new columns the user created
             for col_name, col_type in required_cols:
                 if col_name not in existing_cols:
                     cur.execute(f"ALTER TABLE {safe_table_name} ADD COLUMN [{col_name}] {col_type}")
@@ -206,17 +199,28 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         """)
         
         if show_in_table:
-            # Resolves the actual object Title instead of an obscure ID in the UI View
-            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 LIMIT 1", (target_class_id,))
-            title_row = cur.fetchone()
-            if title_row:
-                target_title_col = title_row[0].replace(' ', '_').lower()
-                display_label = f"[{target_name} ({title_row[0]})]"
+            cur.execute("SELECT name, data_type FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
+            title_rows = cur.fetchall()
+            if title_rows:
+                for t_name, t_type in title_rows:
+                    target_title_col = t_name.replace(' ', '_').lower()
+                    display_label = f"[{target_name} ({t_name})]"
+                    
+                    # FIX: Ensure target table physically has the title column before querying it
+                    sql_type = "TEXT"
+                    if t_type in ("int", "boolean"): sql_type = "INTEGER"
+                    elif t_type == "float": sql_type = "REAL"
+                    try:
+                        cur.execute(f"ALTER TABLE objects_{safe_target_name} ADD COLUMN [{target_title_col}] {sql_type}")
+                    except sqlite3.OperationalError:
+                        pass # Column already exists
+                        
+                    select_clause.append(f"(SELECT GROUP_CONCAT(t.[{target_title_col}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}")
             else:
                 target_title_col = "id"
                 display_label = f"[{target_name} (IDs)]"
                 
-            select_clause.append(f"(SELECT GROUP_CONCAT(t.[{target_title_col}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}")
+                select_clause.append(f"(SELECT GROUP_CONCAT(t.[{target_title_col}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}")
 
     cur.execute("""
         SELECT c.name, r.rel_type, c.id, r.show_in_table 
@@ -241,19 +245,30 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         """)
         
         if show_in_table:
-            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 LIMIT 1", (source_class_id,))
-            title_row = cur.fetchone()
-            if title_row:
-                source_title_col = title_row[0].replace(' ', '_').lower()
-                display_label = f"[From {source_name} ({title_row[0]})]"
+            cur.execute("SELECT name, data_type FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
+            title_rows = cur.fetchall()
+            if title_rows:
+                for t_name, t_type in title_rows:
+                    source_title_col = t_name.replace(' ', '_').lower()
+                    display_label = f"[From {source_name} ({t_name})]"
+                    
+                    # FIX: Ensure source table physically has the title column before querying it
+                    sql_type = "TEXT"
+                    if t_type in ("int", "boolean"): sql_type = "INTEGER"
+                    elif t_type == "float": sql_type = "REAL"
+                    try:
+                        cur.execute(f"ALTER TABLE objects_{safe_source_name} ADD COLUMN [{source_title_col}] {sql_type}")
+                    except sqlite3.OperationalError:
+                        pass # Column already exists
+                        
+                    select_clause.append(f"(SELECT GROUP_CONCAT(t.[{source_title_col}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}")
             else:
                 source_title_col = "id"
                 display_label = f"[From {source_name} (IDs)]"
                 
-            select_clause.append(f"(SELECT GROUP_CONCAT(t.[{source_title_col}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}")
+                select_clause.append(f"(SELECT GROUP_CONCAT(t.[{source_title_col}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}")
             
     # 4. RE-GENERATE DYNAMIC SQL VIEW 
-    # This view acts as the brain for the Data Browser, handling all complex JOINs automatically
     view_name = f"view_{safe_table_name}"
     cur.execute(f"DROP VIEW IF EXISTS {view_name}")
     
@@ -314,7 +329,6 @@ class ObjectEditorDialog(QDialog):
                 'required': bool(is_required)
             }
             
-            # WIDGET GENERATION BASED ON DATA TYPE
             if attr_type == "int":
                 widget = QSpinBox()
                 widget.setRange(-2147483648, 2147483647) 
@@ -327,11 +341,11 @@ class ObjectEditorDialog(QDialog):
                 widget.setText("Yes / True")
             elif attr_type == "date":
                 widget = QDateTimeEdit()
-                widget.setCalendarPopup(True) # Adds a nice UI popup calendar
+                widget.setCalendarPopup(True) 
                 widget.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
             elif attr_type == "long string":
                 widget = QTextEdit()
-                widget.setMaximumHeight(100) # Give it space but don't let it consume the screen
+                widget.setMaximumHeight(100) 
             elif attr_type in ("list", "matrix"):
                 widget = QLineEdit()
                 widget.setText("[]") 
@@ -343,11 +357,10 @@ class ObjectEditorDialog(QDialog):
                 else:
                     widget.setToolTip("Must be a valid python list e.g. ['A', 'B'] or [1, 2]")
             else:
-                widget = QLineEdit() # Default string
+                widget = QLineEdit() 
                 
             self.input_widgets[safe_col_name] = widget
             
-            # Display red asterisk for required fields
             label_text = attr_name + (" <span style='color:red;'>*</span>" if is_required else "") + ":"
             label = QLabel(label_text)
             form_layout.addRow(label, widget)
@@ -381,23 +394,29 @@ class ObjectEditorDialog(QDialog):
             list_widget.setMinimumHeight(120) 
             target_table = f"objects_{safe_target_name}"
             
-            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 LIMIT 1", (target_class_id,))
-            title_row = cur.fetchone()
+            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
+            title_rows = cur.fetchall()
             
             try:
-                if title_row:
-                    title_col = title_row[0].replace(' ', '_').lower()
-                    cur.execute(f"SELECT id, [{title_col}] FROM {target_table}")
+                if title_rows:
+                    title_cols = [r[0].replace(' ', '_').lower() for r in title_rows]
+                    escaped_cols = ", ".join([f"[{c}]" for c in title_cols])
+                    cur.execute(f"SELECT id, {escaped_cols} FROM {target_table}")
+                    
                     for row in cur.fetchall():
                         t_id = row[0]
-                        display_val = row[1]
+                        display_vals = []
                         
-                        if display_val is None or str(display_val).strip() == "":
-                            display_text = f"Unnamed {target_name} (ID: {t_id})"
-                            search_text_data = f"unnamed {target_name}".lower()
-                        else:
-                            display_text = f"{str(display_val)} (ID: {t_id})"
-                            search_text_data = str(display_val).lower()
+                        # Process each title part and replace empty ones with "None"
+                        for val in row[1:]:
+                            if val is None or str(val).strip() == "":
+                                display_vals.append("None")
+                            else:
+                                display_vals.append(str(val))
+                                
+                        combined_titles = " --- ".join(display_vals)
+                        display_text = f"{combined_titles} (ID: {t_id})"
+                        search_text_data = combined_titles.lower()
                             
                         item = QListWidgetItem(display_text)
                         item.setData(Qt.UserRole, t_id)
@@ -415,7 +434,6 @@ class ObjectEditorDialog(QDialog):
                 pass 
                 
             rel_container.addWidget(list_widget)
-            # Dynamic live filtering
             search_box.textChanged.connect(lambda text, lw=list_widget: self.filter_list_items(text, lw))
                 
             self.rel_widgets[junc_table] = {
@@ -425,7 +443,7 @@ class ObjectEditorDialog(QDialog):
             }
             form_layout.addRow(f"Rel: {target_name}:", rel_container)
 
-        # --- PRE-FILL DATA (IF EDITING) ---
+        # --- PRE-FILL DATA ---
         if self.obj_id:
             cols = list(self.input_widgets.keys())
             if cols:
@@ -484,13 +502,11 @@ class ObjectEditorDialog(QDialog):
             item.setHidden(search_text not in search_target)
 
     def keyPressEvent(self, event):
-        # Ignore Enter key to prevent accidental form closing
         if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
             return 
         super().keyPressEvent(event)
 
     def save_record(self):
-        """Extracts data from UI widgets, runs validation, and saves to database."""
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys = 1")
         cur = conn.cursor()
@@ -505,13 +521,12 @@ class ObjectEditorDialog(QDialog):
                 constraints = self.attr_constraints.get(col_name)
                 attr_display_name = constraints['name']
                 
-                # 1. EXTRACT DATA BY WIDGET TYPE
                 if isinstance(widget, QSpinBox) or isinstance(widget, QDoubleSpinBox):
                     val = widget.value()
                     is_empty = False 
                 elif isinstance(widget, QCheckBox):
                     val = 1 if widget.isChecked() else 0
-                    is_empty = False # Checkboxes are technically never "empty"
+                    is_empty = False
                 elif isinstance(widget, QDateTimeEdit):
                     val = widget.dateTime().toString("yyyy-MM-dd HH:mm:ss")
                     is_empty = False
@@ -519,7 +534,7 @@ class ObjectEditorDialog(QDialog):
                     raw_text = widget.toPlainText().strip()
                     is_empty = (raw_text == "")
                     val = None if is_empty else raw_text
-                else: # Standard QLineEdit
+                else: 
                     raw_text = widget.text().strip()
                     is_empty = (raw_text == "")
                     
@@ -527,7 +542,6 @@ class ObjectEditorDialog(QDialog):
                         val = None
                     else:
                         if app_type in ("list", "matrix"):
-                            # SAFE EVALUATION OF LISTS/MATRICES
                             try:
                                 parsed = ast.literal_eval(raw_text)
                                 if not isinstance(parsed, list):
@@ -550,13 +564,11 @@ class ObjectEditorDialog(QDialog):
                         else:
                             val = raw_text
 
-                # 2. ENFORCE REQUIRED CONSTRAINT
                 if constraints['required'] and is_empty:
                     QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' is a required field.")
                     conn.close()
                     return
 
-                # 3. ENFORCE UNIQUE CONSTRAINT
                 if constraints['unique'] and not is_empty:
                     if self.obj_id:
                         cur.execute(f"SELECT id FROM {self.table_name} WHERE [{col_name}] = ? AND id != ?", (val, self.obj_id))
@@ -572,7 +584,6 @@ class ObjectEditorDialog(QDialog):
                 placeholders.append("?")
                 values.append(val)
 
-            # 4. SAVE TO DATABASE
             active_obj_id = self.obj_id
 
             if columns:
@@ -591,7 +602,6 @@ class ObjectEditorDialog(QDialog):
                     cur.execute(query)
                     active_obj_id = cur.lastrowid
                 
-            # Rewrite Relationships safely via Delete & Re-insert
             for junc_table, data in self.rel_widgets.items():
                 if self.obj_id:
                     cur.execute(f"DELETE FROM {junc_table} WHERE source_id = ?", (active_obj_id,))
@@ -631,14 +641,11 @@ class SettingsDialog(QDialog):
         path_layout.addWidget(btn_browse)
         layout.addLayout(path_layout)
 
-        # ADDED STRETCH to push the inputs up and the button down, removing the big gap
         layout.addStretch()
 
-        # In PySide, && tells the button to show a literal "&" instead of creating an alt-key shortcut
         btn_save = QPushButton("Save && Connect")
         btn_save.clicked.connect(self.save_and_check_db)
         
-        # Aligned the save button to the right for better visual flow
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         btn_layout.addWidget(btn_save)
@@ -663,10 +670,6 @@ class SettingsDialog(QDialog):
 
 
 class DataBrowserPage(QWidget):
-    """
-    The main interface for viewing data. 
-    Upgraded to use Explicit DB queries (QSqlQueryModel) for True Pagination and fast Database-Level Filtering!
-    """
     def __init__(self, main_window): 
         super().__init__()
         self.main_window = main_window
@@ -677,7 +680,6 @@ class DataBrowserPage(QWidget):
         self.current_table_name = None
         self.db_path = ""
         
-        # Pagination Tracking
         self.page_size = 100
         self.current_page = 0
         self.total_pages = 0
@@ -690,7 +692,6 @@ class DataBrowserPage(QWidget):
         self.header_label = QLabel("<h2></h2>")
         layout.addWidget(self.header_label)
 
-        # ---- TOP ACTION BAR (Search & Action Buttons) ----
         search_layout = QHBoxLayout()
         
         self.col_combo = QComboBox()
@@ -700,7 +701,7 @@ class DataBrowserPage(QWidget):
         self.search_input.setPlaceholderText("Filter text...")
         self.search_input.returnPressed.connect(self.trigger_search)
         
-        self.btn_search = QPushButton("\U0001F50D Search") # Unicode Magnifying Glass
+        self.btn_search = QPushButton("\U0001F50D Search") 
         self.btn_search.clicked.connect(self.trigger_search)
         
         self.btn_import = QPushButton("\U0001F4E4 Import")
@@ -733,18 +734,16 @@ class DataBrowserPage(QWidget):
         search_layout.addWidget(self.btn_delete)
         layout.addLayout(search_layout)
 
-        # ---- TABLE VIEW ----
         self.table_view = QTableView()
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
-        self.table_view.setEditTriggers(QTableView.NoEditTriggers) # Double-clicking will NOT edit inline
-        self.table_view.doubleClicked.connect(self.open_edit_dialog) # Double-click OPENS standard Edit UI!
+        self.table_view.setEditTriggers(QTableView.NoEditTriggers)
+        self.table_view.doubleClicked.connect(self.open_edit_dialog)
         
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self.show_context_menu)
         
-        # We manually intercept Header clicks to route sorting directly into the SQL query
         self.table_view.setSortingEnabled(True)
         header = self.table_view.horizontalHeader()
         header.setSectionsMovable(True)
@@ -753,21 +752,19 @@ class DataBrowserPage(QWidget):
         header.sortIndicatorChanged.connect(self.on_sort_changed)
         layout.addWidget(self.table_view)
 
-        # Replaced Basic In-Memory Model with Explicit Database Query Model
         self.query_model = QSqlQueryModel()
         self.table_view.setModel(self.query_model)
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
 
-        # ---- BOTTOM BAR (Pagination Controls) ----
         page_layout = QHBoxLayout()
         
-        self.btn_prev = QPushButton("\u25C0 Prev") # Left Arrow
+        self.btn_prev = QPushButton("\u25C0 Prev") 
         self.btn_prev.clicked.connect(self.prev_page)
         
         self.page_label = QLabel("Page 0 of 0 (Total: 0)")
         self.page_label.setAlignment(Qt.AlignCenter)
         
-        self.btn_next = QPushButton("Next \u25B6") # Right Arrow
+        self.btn_next = QPushButton("Next \u25B6") 
         self.btn_next.clicked.connect(self.next_page)
         
         self.page_size_combo = QComboBox()
@@ -802,14 +799,12 @@ class DataBrowserPage(QWidget):
             self.btn_add.setEnabled(False)
             return
             
-        # Reset Search & Sorting State
         self.search_input.clear()
         self.current_sort_col = "ID"
         self.current_sort_order = "ASC"
         self.current_page = 0
         self.table_view.horizontalHeader().setSortIndicator(0, Qt.AscendingOrder)
 
-        # Populate Search Column Combo Box dynamically
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({self.current_view_name})")
@@ -823,14 +818,9 @@ class DataBrowserPage(QWidget):
             self.col_combo.addItem(col_name, i)
         self.col_combo.blockSignals(False)
         
-        # Fire off the first database pull!
         self.build_and_exec_query()
 
     def build_and_exec_query(self):
-        """
-        The core engine of DataBrowser. Builds a dynamic, paginated SQL query 
-        incorporating limits, search filters, and sorting directly into the database engine.
-        """
         if not self.current_view_name: return
         
         conn = sqlite3.connect(self.db_path)
@@ -840,17 +830,16 @@ class DataBrowserPage(QWidget):
         where_clauses = []
         params = []
         
-        # 1. ADD SEARCH FILTERS TO QUERY
         search_text = self.search_input.text().strip()
         if search_text:
             col_idx = self.col_combo.currentData()
-            if col_idx == -1: # Search across ALL columns
+            if col_idx == -1: 
                 cur.execute(f"PRAGMA table_info({self.current_view_name})")
                 col_names = [row[1] for row in cur.fetchall()]
                 or_clauses = [f"[{c}] LIKE ?" for c in col_names]
                 where_clauses.append("(" + " OR ".join(or_clauses) + ")")
                 params.extend([f"%{search_text}%"] * len(col_names))
-            else: # Search specific column
+            else: 
                 col_name = self.col_combo.itemText(self.col_combo.currentIndex())
                 where_clauses.append(f"[{col_name}] LIKE ?")
                 params.append(f"%{search_text}%")
@@ -859,7 +848,6 @@ class DataBrowserPage(QWidget):
         if where_clauses:
             where_sql = " WHERE " + " AND ".join(where_clauses)
             
-        # 2. COUNT TOTALS (For generating correct pagination numbers)
         count_query = f"SELECT COUNT(*) {base_query} {where_sql}"
         cur.execute(count_query, params)
         self.total_records = cur.fetchone()[0]
@@ -868,12 +856,10 @@ class DataBrowserPage(QWidget):
         if self.current_page >= self.total_pages:
             self.current_page = max(0, self.total_pages - 1)
             
-        # 3. COMPILE PAGINATED QUERY (LIMIT / OFFSET)
         offset = self.current_page * self.page_size
         order_sql = f"ORDER BY [{self.current_sort_col}] {self.current_sort_order}"
         final_query = f"SELECT * {base_query} {where_sql} {order_sql} LIMIT {self.page_size} OFFSET {offset}"
         
-        # Execute natively in QtSql to bind to Model
         db = QSqlDatabase.database()
         query = QSqlQuery(db)
         query.prepare(final_query)
@@ -882,7 +868,6 @@ class DataBrowserPage(QWidget):
         
         self.query_model.setQuery(query)
         
-        # 4. UPDATE UI CONTROLS
         self.page_label.setText(f"Page {self.current_page + 1} of {self.total_pages} (Total: {self.total_records})")
         self.btn_prev.setEnabled(self.current_page > 0)
         self.btn_next.setEnabled(self.current_page < self.total_pages - 1)
@@ -958,7 +943,7 @@ class DataBrowserPage(QWidget):
         reply = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete this {self.current_class_name}?\n\nIts relationships will be automatically safely removed.", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             conn = sqlite3.connect(self.db_path)
-            conn.execute("PRAGMA foreign_keys = 1") # Ensures CASCADE DELETE triggers properly on junction tables
+            conn.execute("PRAGMA foreign_keys = 1") 
             cur = conn.cursor()
             try:
                 cur.execute(f"DELETE FROM {self.current_table_name} WHERE id = ?", (obj_id,))
@@ -979,7 +964,6 @@ class DataBrowserPage(QWidget):
         elif "excel" in selected_filter.lower() and not file_path.lower().endswith(".xlsx"):
             file_path += ".xlsx"
             
-        # Temporarily query ALL data directly to export instead of just paginated rows
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({self.current_view_name})")
@@ -989,7 +973,6 @@ class DataBrowserPage(QWidget):
         raw_data = cur.fetchall()
         conn.close()
         
-        # Convert nulls to empty strings safely
         data = [["" if v is None else str(v) for v in row] for row in raw_data]
 
         if file_path.endswith(".csv"):
@@ -1023,9 +1006,6 @@ class DataBrowserPage(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export: {e}")
 
-    # ==========================================
-    # BULK IMPORT LOGIC (TWO-PASS ALGORITHM)
-    # ==========================================
     def import_data(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Import Data", "", "Excel Files (*.xlsx)")
         if not file_path: return
@@ -1037,13 +1017,9 @@ class DataBrowserPage(QWidget):
             return
             
         try:
-            # ---------------------------------------------------------
-            # PHASE 1: PREPARE AND FETCH DATABASE SCHEMA (Metadata)
-            # ---------------------------------------------------------
             conn = sqlite3.connect(self.db_path)
             cur = conn.cursor()
             
-            # Fetch Attributes mapping
             cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ?", (self.current_class_id,))
             attributes_meta = {}
             for attr_id, name, d_type, is_uniq, is_req in cur.fetchall():
@@ -1054,7 +1030,6 @@ class DataBrowserPage(QWidget):
                     "required": bool(is_req)
                 }
                 
-            # Fetch Matrix shape metadata
             matrix_counts = {}
             cur.execute("""
                 SELECT a.name, COUNT(m.id) 
@@ -1064,7 +1039,6 @@ class DataBrowserPage(QWidget):
             for attr_name, col_count in cur.fetchall():
                 matrix_counts[attr_name.lower()] = col_count
                 
-            # Fetch Relationships mapping
             cur.execute("""
                 SELECT c.name, r.rel_type, c.id 
                 FROM relationships r JOIN classes c ON r.target_class = c.id 
@@ -1078,16 +1052,12 @@ class DataBrowserPage(QWidget):
                     "junc_table": f"rel_{self.current_table_name}_to_objects_{safe_target_name}"
                 }
 
-            # Pre-load uniquely constrained database values into memory for instant checking
             existing_unique_values = {}
             for name_lower, meta in attributes_meta.items():
                 if meta["unique"]:
                     cur.execute(f"SELECT [{meta['safe_col']}] FROM {self.current_table_name} WHERE [{meta['safe_col']}] IS NOT NULL")
                     existing_unique_values[meta["safe_col"]] = set(row[0] for row in cur.fetchall())
 
-            # ---------------------------------------------------------
-            # PHASE 2: LOAD EXCEL AND MAP HEADERS
-            # ---------------------------------------------------------
             wb = openpyxl.load_workbook(file_path, data_only=True)
             ws = wb.active
             
@@ -1097,21 +1067,17 @@ class DataBrowserPage(QWidget):
                 
             headers = [str(h).lower().strip() if h else "" for h in all_rows[0]]
             
-            # Global missing column check for required fields
             for name_lower, meta in attributes_meta.items():
                 if meta["required"] and name_lower not in headers:
                     raise ValueError(f"CRITICAL: The required attribute '{meta['safe_col']}' is completely missing from the Excel headers!")
 
-            # ---------------------------------------------------------
-            # PHASE 3: VALIDATION PASS (IN-MEMORY)
-            # ---------------------------------------------------------
             in_file_unique_tracker = {meta["safe_col"]: set() for meta in attributes_meta.values() if meta["unique"]}
             validated_inserts = []
             validated_relationships = []
 
             for row_number, row_data in enumerate(all_rows[1:], start=2): 
                 if all(cell is None or str(cell).strip() == "" for cell in row_data):
-                    continue # Skip fully blank rows
+                    continue 
 
                 insert_cols = []
                 insert_vals = []
@@ -1122,7 +1088,6 @@ class DataBrowserPage(QWidget):
                     header = headers[col_idx]
                     if not header: continue
                     
-                    # Ensure pure dates format perfectly into strings for SQLite
                     if isinstance(cell_value, datetime.datetime):
                         val = cell_value.strftime("%Y-%m-%d %H:%M:%S")
                     else:
@@ -1130,7 +1095,6 @@ class DataBrowserPage(QWidget):
                     
                     is_empty = (val is None)
 
-                    # --- ATTRIBUTES PIPELINE ---
                     if header in attributes_meta:
                         meta = attributes_meta[header]
                         safe_col = meta["safe_col"]
@@ -1140,7 +1104,6 @@ class DataBrowserPage(QWidget):
                                 raise ValueError(f"Row {row_number}: '{header}' is Required but cell is empty.")
                             val_final = None
                         else:
-                            # Advanced data validation logic based on type
                             if meta["type"] == "int":
                                 try: val_final = int(float(val))
                                 except: raise ValueError(f"Row {row_number}: '{header}' must be an Integer.")
@@ -1165,9 +1128,8 @@ class DataBrowserPage(QWidget):
                                 except Exception as e:
                                     raise ValueError(f"Row {row_number}: Invalid python syntax in '{header}'. {e}")
                             else:
-                                val_final = val # Default pass for standard Text/Dates/Long Strings
+                                val_final = val 
                                 
-                        # Uniqueness validations 
                         if meta["unique"] and val_final is not None:
                             if val_final in existing_unique_values[safe_col]:
                                 raise ValueError(f"Row {row_number}: '{header}' is Unique. The value '{val_final}' already exists in the database.")
@@ -1178,7 +1140,6 @@ class DataBrowserPage(QWidget):
                         insert_cols.append(f"[{safe_col}]")
                         insert_vals.append(val_final)
 
-                    # --- RELATIONSHIPS PIPELINE ---
                     elif header in relationships_meta:
                         if not is_empty:
                             rel_meta = relationships_meta[header]
@@ -1187,7 +1148,6 @@ class DataBrowserPage(QWidget):
                             except ValueError:
                                 raise ValueError(f"Row {row_number}: Relationship '{header}' must be comma-separated numeric IDs.")
                                 
-                            # Pre-flight query: Do these target IDs actually exist in DB?
                             for tid in target_ids:
                                 cur.execute(f"SELECT id FROM {rel_meta['target_table']} WHERE id = ?", (tid,))
                                 if not cur.fetchone():
@@ -1198,9 +1158,6 @@ class DataBrowserPage(QWidget):
                 validated_inserts.append((insert_cols, insert_vals))
                 validated_relationships.append(pending_rels)
 
-            # ---------------------------------------------------------
-            # PHASE 4: THE INSERTION PASS (Database Transaction)
-            # ---------------------------------------------------------
             records_imported = 0
             for i, (cols, vals) in enumerate(validated_inserts):
                 if not cols:
@@ -1230,7 +1187,6 @@ class DataBrowserPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """The central application window wrapping sidebar directory trees and the data viewer."""
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nexus")
@@ -1333,7 +1289,6 @@ class MainWindow(QMainWindow):
     def change_class(self, item, column):
         class_id = item.data(0, Qt.UserRole)
         if class_id:
-            # Only trigger for files (leaves), not folders
             class_name = item.text(0).replace("📄 ", "") 
             self.data_browser.load_table_data(class_id, class_name)
 
@@ -1342,14 +1297,9 @@ if __name__ == "__main__":
     app.setStyle("Fusion") 
     app.setWindowIcon(get_app_icon()) 
     
-    # --- GLOBAL FONT SIZE ADJUSTMENT ---
-    # We grab the clean, native system default font...
     app_font = app.font()
-    # Standard desktop fonts are usually 9pt. 11pt gives a nice, subtle boost.
     app_font.setPointSize(10)
-    # Apply it globally to all windows, buttons, and tables!
     app.setFont(app_font)
-    # -----------------------------------
 
     window = MainWindow()
     window.show()
