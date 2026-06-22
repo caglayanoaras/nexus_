@@ -1,5 +1,0 @@
---- Script Executed at 2026-06-22 00:39:29 ---
-
-   ID  name  age From class2 (name) From class2 (location)
-0   1  anan   42                  3                      5
-None

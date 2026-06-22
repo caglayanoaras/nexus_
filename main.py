@@ -13,11 +13,12 @@ except ImportError:
     pd = None
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QTableView, 
     QHeaderView, QMessageBox, QFileDialog, QListWidget, QListWidgetItem, QDialog,
     QSplitter, QScrollArea, QComboBox, QInputDialog, QFormLayout, QSpinBox, 
-    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit, QTabWidget
+    QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit, QTabWidget,
+    QMenuBar, QMenu
 )
 from PySide6.QtCore import Qt, QSettings, QDateTime
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
@@ -40,18 +41,49 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
 
     safe_table_name = f"objects_{class_name.replace(' ', '_').lower()}"
     
+    # Ensure attributes schema is up to date dynamically for older databases
+    try:
+        cur.execute("ALTER TABLE attributes ADD COLUMN lookup_query TEXT")
+    except sqlite3.OperationalError:
+        pass
+    
     # 1. FETCH METADATA
-    cur.execute("SELECT name, data_type, show_in_table, is_title FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
+    cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
     attributes = cur.fetchall()
     
     required_cols = []
     attr_app_types = {}
     
     select_clause = ["m.id AS [ID]"]
+    full_select_clause = ["m.id AS [ID]"]
     
-    for attr_name, attr_type, show_in_table, is_title in attributes:
+    for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
         safe_col_name = attr_name.replace(' ', '_').lower()
         
+        # HANDLE VIRTUAL 'LOOK-THROUGH' ATTRIBUTES
+        if attr_type == "look-through":
+            if lookup_query:
+                try:
+                    tgt_class, tgt_attr = lookup_query.split('.')
+                    safe_tgt_class = tgt_class.strip().replace(' ', '_').lower()
+                    safe_tgt_attr = tgt_attr.strip().replace(' ', '_').lower()
+                    
+                    junc_table = f"rel_{safe_table_name}_to_objects_{safe_tgt_class}"
+                    # Lookup retrieves exact value directly from the physical target table via junction
+                    subquery = f"(SELECT GROUP_CONCAT(tgt.[{safe_tgt_attr}]) FROM {junc_table} j JOIN objects_{safe_tgt_class} tgt ON j.target_id = tgt.id WHERE j.source_id = m.id)"
+                    if show_in_table:
+                        select_clause.append(f"{subquery} AS [{attr_name}]")
+                    full_select_clause.append(f"{subquery} AS [{attr_name}]")
+                except Exception:
+                    # Failsafe if string format is invalid
+                    if show_in_table:
+                        select_clause.append(f"NULL AS [{attr_name}]")
+                    full_select_clause.append(f"NULL AS [{attr_name}]")
+            
+            # Record type but do NOT append to required_cols because it's completely virtual!
+            attr_app_types[safe_col_name] = attr_type
+            continue
+
         # MAP APP DATA TYPES TO SQLITE DATA TYPES
         if attr_type in ("int", "boolean"):
             sql_type = "INTEGER"
@@ -65,6 +97,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         
         if show_in_table:
             select_clause.append(f"m.[{safe_col_name}] AS [{attr_name}]")
+        full_select_clause.append(f"m.[{safe_col_name}] AS [{attr_name}]")
 
     # 2. CREATE OR UPDATE PRIMARY TABLE
     cur.execute(f"SELECT count(name) FROM sqlite_master WHERE type='table' AND name='{safe_table_name}'")
@@ -183,7 +216,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 if col_name not in existing_cols:
                     cur.execute(f"ALTER TABLE {safe_table_name} ADD COLUMN [{col_name}] {col_type}")
 
-    # 3. GENERATE JUNCTION TABLES
+    # 3. GENERATE JUNCTION TABLES (Flattened logic preventing Circular Dependencies)
     cur.execute("""
         SELECT c.name, r.rel_type, c.id, r.show_in_table 
         FROM relationships r JOIN classes c ON r.target_class = c.id 
@@ -206,29 +239,40 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             )
         """)
         
-        if show_in_table:
-            cur.execute("SELECT name, data_type FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
-            title_rows = cur.fetchall()
-            if title_rows:
-                for t_name, t_type in title_rows:
-                    target_title_col = t_name.replace(' ', '_').lower()
-                    display_label = f"[{target_name} ({t_name})]"
-                    
-                    # FIX: Ensure target table physically has the title column before querying it
-                    sql_type = "TEXT"
-                    if t_type in ("int", "boolean"): sql_type = "INTEGER"
-                    elif t_type == "float": sql_type = "REAL"
+        cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
+        title_rows = cur.fetchall()
+        if title_rows:
+            for t_name, t_type, t_lookup in title_rows:
+                display_label = f"[{target_name} ({t_name})]"
+                if t_type == "look-through" and t_lookup:
                     try:
-                        cur.execute(f"ALTER TABLE objects_{safe_target_name} ADD COLUMN [{target_title_col}] {sql_type}")
-                    except sqlite3.OperationalError:
-                        pass # Column already exists
+                        tgt_tgt_class, tgt_tgt_attr = t_lookup.split('.')
+                        safe_tgt_tgt_class = tgt_tgt_class.strip().replace(' ', '_').lower()
+                        safe_tgt_tgt_attr = tgt_tgt_attr.strip().replace(' ', '_').lower()
                         
-                    select_clause.append(f"(SELECT GROUP_CONCAT(t.[{target_title_col}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}")
-            else:
-                target_title_col = "id"
-                display_label = f"[{target_name} (IDs)]"
-                
-                select_clause.append(f"(SELECT GROUP_CONCAT(t.[{target_title_col}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}")
+                        junc_bc = f"rel_objects_{safe_target_name}_to_objects_{safe_tgt_tgt_class}"
+                        # Join physical tables explicitly
+                        subquery = f"(SELECT GROUP_CONCAT(tgt_tgt.[{safe_tgt_tgt_attr}]) FROM {junc_table} j_ab JOIN {junc_bc} j_bc ON j_ab.target_id = j_bc.source_id JOIN objects_{safe_tgt_tgt_class} tgt_tgt ON j_bc.target_id = tgt_tgt.id WHERE j_ab.source_id = m.id)"
+                        if show_in_table:
+                            select_clause.append(f"{subquery} AS {display_label}")
+                        full_select_clause.append(f"{subquery} AS {display_label}")
+                    except Exception:
+                        if show_in_table:
+                            select_clause.append(f"NULL AS {display_label}")
+                        full_select_clause.append(f"NULL AS {display_label}")
+                else:
+                    safe_t_name = t_name.replace(' ', '_').lower()
+                    # Join physical tables explicitly
+                    query_str = f"(SELECT GROUP_CONCAT(t.[{safe_t_name}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}"
+                    if show_in_table:
+                        select_clause.append(query_str)
+                    full_select_clause.append(query_str)
+        else:
+            display_label = f"[{target_name} (IDs)]"
+            query_str = f"(SELECT GROUP_CONCAT(t.id) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}"
+            if show_in_table:
+                select_clause.append(query_str)
+            full_select_clause.append(query_str)
 
     cur.execute("""
         SELECT c.name, r.rel_type, c.id, r.show_in_table 
@@ -252,36 +296,52 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             )
         """)
         
-        if show_in_table:
-            cur.execute("SELECT name, data_type FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
-            title_rows = cur.fetchall()
-            if title_rows:
-                for t_name, t_type in title_rows:
-                    source_title_col = t_name.replace(' ', '_').lower()
-                    display_label = f"[From {source_name} ({t_name})]"
-                    
-                    # FIX: Ensure source table physically has the title column before querying it
-                    sql_type = "TEXT"
-                    if t_type in ("int", "boolean"): sql_type = "INTEGER"
-                    elif t_type == "float": sql_type = "REAL"
+        cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
+        title_rows = cur.fetchall()
+        if title_rows:
+            for t_name, t_type, t_lookup in title_rows:
+                display_label = f"[From {source_name} ({t_name})]"
+                if t_type == "look-through" and t_lookup:
                     try:
-                        cur.execute(f"ALTER TABLE objects_{safe_source_name} ADD COLUMN [{source_title_col}] {sql_type}")
-                    except sqlite3.OperationalError:
-                        pass # Column already exists
+                        tgt_tgt_class, tgt_tgt_attr = t_lookup.split('.')
+                        safe_tgt_tgt_class = tgt_tgt_class.strip().replace(' ', '_').lower()
+                        safe_tgt_tgt_attr = tgt_tgt_attr.strip().replace(' ', '_').lower()
                         
-                    select_clause.append(f"(SELECT GROUP_CONCAT(t.[{source_title_col}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}")
-            else:
-                source_title_col = "id"
-                display_label = f"[From {source_name} (IDs)]"
-                
-                select_clause.append(f"(SELECT GROUP_CONCAT(t.[{source_title_col}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}")
+                        junc_sc = f"rel_objects_{safe_source_name}_to_objects_{safe_tgt_tgt_class}"
+                        # Join physical tables explicitly
+                        subquery = f"(SELECT GROUP_CONCAT(tgt_tgt.[{safe_tgt_tgt_attr}]) FROM {junc_table} j_ab JOIN {junc_sc} j_sc ON j_ab.source_id = j_sc.source_id JOIN objects_{safe_tgt_tgt_class} tgt_tgt ON j_sc.target_id = tgt_tgt.id WHERE j_ab.target_id = m.id)"
+                        if show_in_table:
+                            select_clause.append(f"{subquery} AS {display_label}")
+                        full_select_clause.append(f"{subquery} AS {display_label}")
+                    except Exception:
+                        if show_in_table:
+                            select_clause.append(f"NULL AS {display_label}")
+                        full_select_clause.append(f"NULL AS {display_label}")
+                else:
+                    safe_t_name = t_name.replace(' ', '_').lower()
+                    # Join physical tables explicitly
+                    query_str = f"(SELECT GROUP_CONCAT(t.[{safe_t_name}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}"
+                    if show_in_table:
+                        select_clause.append(query_str)
+                    full_select_clause.append(query_str)
+        else:
+            display_label = f"[From {source_name} (IDs)]"
+            query_str = f"(SELECT GROUP_CONCAT(t.id) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}"
+            if show_in_table:
+                select_clause.append(query_str)
+            full_select_clause.append(query_str)
             
     # 4. RE-GENERATE DYNAMIC SQL VIEW 
     view_name = f"view_{safe_table_name}"
     cur.execute(f"DROP VIEW IF EXISTS {view_name}")
-    
     view_sql = f"CREATE VIEW {view_name} AS SELECT {', '.join(select_clause)} FROM {safe_table_name} m"
     cur.execute(view_sql)
+
+    # 5. GENERATE A FULL OMNI-VIEW FOR DATA EXPORT/MODULES
+    full_view_name = f"full_view_{safe_table_name}"
+    cur.execute(f"DROP VIEW IF EXISTS {full_view_name}")
+    full_view_sql = f"CREATE VIEW {full_view_name} AS SELECT {', '.join(full_select_clause)} FROM {safe_table_name} m"
+    cur.execute(full_view_sql)
 
     conn.commit()
     conn.close()
@@ -330,6 +390,11 @@ class ObjectEditorDialog(QDialog):
 
         for attr_id, attr_name, attr_type, is_unique, is_required in attributes:
             safe_col_name = attr_name.replace(' ', '_').lower()
+            
+            # Virtual look-through fields shouldn't have manual input boxes
+            if attr_type == "look-through":
+                continue
+                
             self.attr_app_types[safe_col_name] = attr_type
             self.attr_constraints[safe_col_name] = {
                 'name': attr_name,
@@ -400,22 +465,21 @@ class ObjectEditorDialog(QDialog):
                 list_widget.setSelectionMode(QListWidget.MultiSelection)
                 
             list_widget.setMinimumHeight(120) 
-            target_table = f"objects_{safe_target_name}"
             
-            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
+            cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
             title_rows = cur.fetchall()
             
             try:
                 if title_rows:
-                    title_cols = [r[0].replace(' ', '_').lower() for r in title_rows]
+                    title_cols = [r[0] for r in title_rows] 
                     escaped_cols = ", ".join([f"[{c}]" for c in title_cols])
-                    cur.execute(f"SELECT id, {escaped_cols} FROM {target_table}")
+                    # Query directly from View so derived Look-through titles resolve beautifully!
+                    cur.execute(f"SELECT [ID], {escaped_cols} FROM view_objects_{safe_target_name}")
                     
                     for row in cur.fetchall():
                         t_id = row[0]
                         display_vals = []
                         
-                        # Process each title part and replace empty ones with "None"
                         for val in row[1:]:
                             if val is None or str(val).strip() == "":
                                 display_vals.append("None")
@@ -431,7 +495,7 @@ class ObjectEditorDialog(QDialog):
                         item.setData(Qt.UserRole + 1, search_text_data)
                         list_widget.addItem(item)
                 else:
-                    cur.execute(f"SELECT id FROM {target_table}")
+                    cur.execute(f"SELECT [ID] FROM view_objects_{safe_target_name}")
                     for row in cur.fetchall():
                         t_id = row[0]
                         item = QListWidgetItem(f"{target_name} #{t_id}")
@@ -631,7 +695,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Database Settings")
         self.setWindowIcon(get_app_icon())
-        self.resize(500, 250)
+        self.resize(700, 250)
         self.settings = QSettings("MyCompany", "DatabaseManagerApp")
         
         main_layout = QVBoxLayout(self)
@@ -653,7 +717,15 @@ class SettingsDialog(QDialog):
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(btn_browse)
         db_layout.addLayout(path_layout)
+        
+        btn_db_layout = QHBoxLayout()
+        btn_db_layout.addStretch()
+        btn_db_save = QPushButton("Save")
+        btn_db_save.clicked.connect(self.save_db_settings)
+        btn_db_layout.addWidget(btn_db_save)
+        
         db_layout.addStretch()
+        db_layout.addLayout(btn_db_layout)
         self.tabs.addTab(db_tab, "Database")
 
         # --- Modules Tab ---
@@ -679,16 +751,16 @@ class SettingsDialog(QDialog):
         out_layout.addWidget(self.output_input)
         out_layout.addWidget(btn_browse_out)
         mod_layout.addLayout(out_layout)
-        mod_layout.addStretch()
-        self.tabs.addTab(mod_tab, "Modules")
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        btn_save = QPushButton("Save && Connect")
-        btn_save.clicked.connect(self.save_and_check_db)
-        btn_layout.addWidget(btn_save)
         
-        main_layout.addLayout(btn_layout)
+        btn_mod_layout = QHBoxLayout()
+        btn_mod_layout.addStretch()
+        btn_mod_save = QPushButton("Save")
+        btn_mod_save.clicked.connect(self.save_module_path)
+        btn_mod_layout.addWidget(btn_mod_save)
+        
+        mod_layout.addStretch()
+        mod_layout.addLayout(btn_mod_layout)
+        self.tabs.addTab(mod_tab, "Modules")
 
     def browse_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Select SQLite Database", "", "SQLite DB (*.db *.sqlite)")
@@ -700,17 +772,17 @@ class SettingsDialog(QDialog):
         if file_name:
             self.output_input.setText(file_name)
 
-    def save_and_check_db(self):
+    def save_db_settings(self):
         path = self.path_input.text().strip()
         if not path: return
-
         if not os.path.exists(path):
             init_db(path)
-
         self.settings.setValue("db_path", path)
+        QMessageBox.information(self, "Success", "Database path saved as default.")
+        
+    def save_module_path(self):
         self.settings.setValue("module_output_path", self.output_input.text().strip())
-        QMessageBox.information(self, "Success", "Database connected and set as default.")
-        self.accept() 
+        QMessageBox.information(self, "Success", "Module output path saved.")
 
 
 class ModuleBuilderDialog(QDialog):
@@ -799,7 +871,6 @@ class ModuleBuilderDialog(QDialog):
     def get_all_modules(self):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        # Ensure modules table exists in case init_db wasn't triggered manually on old db files
         cur.execute("""
             CREATE TABLE IF NOT EXISTS modules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -885,7 +956,6 @@ class ModuleBuilderDialog(QDialog):
             
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        # Fallback table check incase init_db was skipped
         cur.execute("""
             CREATE TABLE IF NOT EXISTS modules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -938,13 +1008,13 @@ class ModuleBuilderDialog(QDialog):
         cls_id = row[0]
         conn.close()
         
-        # Ensure the view exists and is perfectly up to date before querying
-        view_name, _ = sync_physical_table(self.db_path, cls_id, class_name, parent_widget=None)
+        view_name, safe_table_name = sync_physical_table(self.db_path, cls_id, class_name, parent_widget=None)
         if not view_name:
             raise RuntimeError(f"Failed to sync schema for class '{class_name}'.")
             
+        full_view_name = f"full_view_{safe_table_name}"
         conn = sqlite3.connect(self.db_path)
-        df = pd.read_sql_query(f"SELECT * FROM {view_name}", conn)
+        df = pd.read_sql_query(f"SELECT * FROM {full_view_name}", conn)
         conn.close()
         return df
 
@@ -953,21 +1023,18 @@ class ModuleBuilderDialog(QDialog):
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
         
-        # Define the execution context containing our custom API
         context = {
             'get_objects': self.get_objects,
-            'pd': pd  # Safely provide pandas so they don't have to import it
+            'pd': pd 
         }
         
         try:
             with open(out_path, 'w', encoding='utf-8') as f:
                 f.write(f"--- Script Executed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
-                # Redirect print() statements directly to the text file
                 with redirect_stdout(f), redirect_stderr(f):
                     exec(code, context)
             QMessageBox.information(self, "Success", f"Script executed successfully.\nOutput saved to:\n{out_path}")
         except Exception as e:
-            # If the script crashes, append the traceback to the file so they can debug it
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write("\n\n--- RUNTIME ERROR ---\n")
                 traceback.print_exc(file=f)
@@ -1055,6 +1122,11 @@ class DataBrowserPage(QWidget):
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
         header.sortIndicatorChanged.connect(self.on_sort_changed)
+        
+        # Enable Right-Click to hide specific columns temporarily
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self.show_header_context_menu)
+        
         layout.addWidget(self.table_view)
 
         self.query_model = QSqlQueryModel()
@@ -1108,7 +1180,11 @@ class DataBrowserPage(QWidget):
         self.current_sort_col = "ID"
         self.current_sort_order = "ASC"
         self.current_page = 0
-        self.table_view.horizontalHeader().setSortIndicator(0, Qt.AscendingOrder)
+        
+        header = self.table_view.horizontalHeader()
+        header.blockSignals(True)
+        header.setSortIndicator(0, Qt.AscendingOrder)
+        header.blockSignals(False)
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -1181,6 +1257,8 @@ class DataBrowserPage(QWidget):
 
     def on_sort_changed(self, logical_index, order):
         col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
+        if not col_name: 
+            return 
         self.current_sort_col = col_name
         self.current_sort_order = "ASC" if order == Qt.AscendingOrder else "DESC"
         self.build_and_exec_query()
@@ -1215,6 +1293,41 @@ class DataBrowserPage(QWidget):
         idx = rows[0]
         id_index = self.query_model.index(idx.row(), 0)
         return self.query_model.data(id_index)
+
+    def show_header_context_menu(self, position):
+        header = self.table_view.horizontalHeader()
+        logical_index = header.logicalIndexAt(position)
+        
+        menu = QMenu()
+        
+        # 1. Action to hide the specific column clicked
+        act_hide = None
+        if logical_index >= 0:
+            col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
+            if col_name:
+                # Safety check: prevent hiding the very last visible column!
+                visible_count = sum(1 for i in range(header.count()) if not self.table_view.isColumnHidden(i))
+                if visible_count > 1:
+                    act_hide = menu.addAction(f"Hide '{col_name}' Temporarily")
+        
+        # 2. Action to unhide all columns (if any are currently hidden)
+        hidden_cols = [i for i in range(header.count()) if self.table_view.isColumnHidden(i)]
+        act_unhide = None
+        if hidden_cols:
+            if act_hide:
+                menu.addSeparator()
+            act_unhide = menu.addAction("Unhide All Columns")
+            
+        if not menu.actions():
+            return
+            
+        action = menu.exec(header.viewport().mapToGlobal(position))
+        
+        if act_hide and action == act_hide:
+            self.table_view.setColumnHidden(logical_index, True)
+        elif act_unhide and action == act_unhide:
+            for i in range(header.count()):
+                self.table_view.setColumnHidden(i, False)
 
     def show_context_menu(self, position):
         if not self.table_view.selectionModel().selectedRows():
@@ -1328,6 +1441,8 @@ class DataBrowserPage(QWidget):
             cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ?", (self.current_class_id,))
             attributes_meta = {}
             for attr_id, name, d_type, is_uniq, is_req in cur.fetchall():
+                if d_type == "look-through": continue
+                
                 attributes_meta[name.lower()] = {
                     "safe_col": name.replace(' ', '_').lower(),
                     "type": d_type,
@@ -1491,17 +1606,20 @@ class DataBrowserPage(QWidget):
             if 'conn' in locals(): conn.close()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nexus")
         self.setWindowIcon(get_app_icon())
         self.resize(1200, 768)
 
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+
         self.setup_menu()
 
         splitter = QSplitter(Qt.Horizontal)
-        self.setCentralWidget(splitter)
+        self.main_layout.addWidget(splitter)
 
         self.sidebar = QTreeWidget()
         self.sidebar.setHeaderHidden(True)
@@ -1515,7 +1633,9 @@ class MainWindow(QMainWindow):
         self.refresh_sidebar()
 
     def setup_menu(self):
-        menubar = self.menuBar()
+        menubar = QMenuBar(self)
+        self.main_layout.setMenuBar(menubar)
+        
         db_menu = menubar.addMenu("Database")
 
         action_settings = QAction("\u2699\uFE0F Settings", self)
@@ -1537,8 +1657,8 @@ class MainWindow(QMainWindow):
 
     def open_settings(self):
         dialog = SettingsDialog(self)
-        if dialog.exec(): 
-            self.refresh_sidebar()
+        dialog.exec()
+        self.refresh_sidebar()
 
     def open_builder(self):
         dialog = ClassBuilderDialog(self)
@@ -1547,25 +1667,53 @@ class MainWindow(QMainWindow):
 
     def open_module_builder(self):
         db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
-        if not db_path or not os.path.exists(db_path):
-            QMessageBox.warning(self, "No Database", "Please connect to a database first via Settings.")
-            return
         dialog = ModuleBuilderDialog(db_path, self)
         dialog.exec()
         
     def open_module_api(self):
         QMessageBox.information(self, "Module API", "Documentation coming soon...\n\nCurrently available built-in functions:\n\nget_objects(class_name)\n-> Returns a complete Pandas DataFrame of the specified class, including automatically resolved multi-title relationships.")
 
+    def sync_all_classes(self, db_path):
+        """
+        Runs on startup to ensure all tables & views physically exist so that cross-view
+        dependencies (like Look-through titles) evaluate smoothly without missing table errors.
+        """
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, name FROM classes")
+            classes = cur.fetchall()
+        except sqlite3.OperationalError:
+            classes = []
+        conn.close()
+        
+        # Max 3 passes to naturally resolve generated views referencing other views
+        for _ in range(3):
+            all_success = True
+            for cid, cname in classes:
+                try:
+                    sync_physical_table(db_path, cid, cname)
+                except sqlite3.OperationalError as e:
+                    if "no such" in str(e).lower() or "no such column" in str(e).lower():
+                        all_success = False
+                    else:
+                        pass # Ignore other operational errors during syncing pass
+            if all_success:
+                break
+
     def refresh_sidebar(self):
         self.sidebar.clear()
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         db_path = settings.value("db_path", "")
         
-        if not db_path or not os.path.exists(db_path):
-            item = QTreeWidgetItem(["No database connected."])
-            item.setFlags(Qt.NoItemFlags)
-            self.sidebar.addTopLevelItem(item)
-            return
+        # Auto-connect handling: Define a default if completely empty
+        if not db_path:
+            db_path = os.path.join(os.path.expanduser("~"), "nexus_default.db")
+            settings.setValue("db_path", db_path)
+            
+        # Ensure the fallback / new path physical DB actually initializes
+        if not os.path.exists(db_path):
+            init_db(db_path)
 
         if QSqlDatabase.contains():
             db = QSqlDatabase.database()
@@ -1573,6 +1721,9 @@ class MainWindow(QMainWindow):
             db = QSqlDatabase.addDatabase("QSQLITE")
         db.setDatabaseName(db_path)
         if not db.open(): return
+
+        # Pre-generate dynamic views to guarantee cross-linking schema integrity
+        self.sync_all_classes(db_path)
 
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()

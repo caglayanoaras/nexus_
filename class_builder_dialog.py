@@ -43,8 +43,7 @@ def init_db(db_path=DB_NAME):
             show_in_table INTEGER DEFAULT 1,
             is_title INTEGER DEFAULT 0,
             is_unique INTEGER DEFAULT 0,
-            is_required INTEGER DEFAULT 0,
-            FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE
+            is_required INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS matrix_columns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +69,13 @@ def init_db(db_path=DB_NAME):
             code TEXT DEFAULT ''
         );
     """)
+    
+    # Safely upgrade existing schemas for look-through support
+    try:
+        cursor.execute("ALTER TABLE attributes ADD COLUMN lookup_query TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+        
     conn.commit()
     return conn
 
@@ -94,7 +100,7 @@ class ReorderableRow(QWidget):
 
 class AttributeRow(ReorderableRow):
     """UI Widget representing a single attribute inside the Class Builder."""
-    def __init__(self, parent_layout, attr_data=None):
+    def __init__(self, parent_layout, valid_lookups=[], attr_data=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
         
@@ -102,11 +108,11 @@ class AttributeRow(ReorderableRow):
         layout.setContentsMargins(0, 0, 0, 0)
 
         # Reordering Buttons
-        self.btn_up = QPushButton("\u25B2") # Unicode Up Arrow
+        self.btn_up = QPushButton("\u25B2") 
         self.btn_up.setFixedWidth(25)
         self.btn_up.clicked.connect(self.move_up)
         
-        self.btn_down = QPushButton("\u25BC") # Unicode Down Arrow
+        self.btn_down = QPushButton("\u25BC") 
         self.btn_down.setFixedWidth(25)
         self.btn_down.clicked.connect(self.move_down)
 
@@ -116,9 +122,18 @@ class AttributeRow(ReorderableRow):
         # Data Type Selection
         self.type_combo = QComboBox()
         self.type_combo.addItems([
-            "int", "float", "string", "long string", "date", "boolean", "list", "matrix"
+            "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "look-through"
         ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
+        
+        # Look-through configuration input (Now a dropdown!)
+        self.lookup_input = QComboBox()
+        self.lookup_input.setEditable(True) # Allows manual typing just in case
+        self.lookup_input.addItems(valid_lookups)
+        self.lookup_input.setCurrentIndex(-1)
+        self.lookup_input.setPlaceholderText("TargetClass.Attribute")
+        self.lookup_input.setVisible(False)
+        self.lookup_input.setToolTip("Select from existing attributes or type manually (TargetClass.Attribute)")
         
         # Constraints and UI preferences
         self.show_cb = QCheckBox("Show")
@@ -142,6 +157,7 @@ class AttributeRow(ReorderableRow):
         layout.addWidget(self.btn_down)
         layout.addWidget(self.name_input)
         layout.addWidget(self.type_combo)
+        layout.addWidget(self.lookup_input)
         layout.addWidget(self.show_cb)
         layout.addWidget(self.title_cb)
         layout.addWidget(self.unique_cb)
@@ -158,11 +174,12 @@ class AttributeRow(ReorderableRow):
             self.unique_cb.setChecked(bool(attr_data.get('is_unique', 0)))
             self.req_cb.setChecked(bool(attr_data.get('is_required', 0)))
             self.matrix_cols = attr_data.get('matrix_cols', [])
+            self.lookup_input.setCurrentText(attr_data.get('lookup_query', ''))
             self.on_type_changed(attr_data['type'])
 
     def on_type_changed(self, text):
-        # Only show the "Set Cols" button if the user selected matrix
         self.matrix_btn.setVisible(text == "matrix")
+        self.lookup_input.setVisible(text == "look-through")
 
     def set_matrix_columns(self):
         current_cols = ",".join(self.matrix_cols)
@@ -226,7 +243,7 @@ class ClassBuilderDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Nexus - Class Builder")
         self.setWindowIcon(get_app_icon())
-        self.resize(900, 600)
+        self.resize(1000, 600)
         
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         path = settings.value("db_path", "").strip()
@@ -288,7 +305,8 @@ class ClassBuilderDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_attr = QPushButton("+ Add Attribute")
-        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout)))
+        # Generate the dropdown list on the fly whenever a new attribute is added
+        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.get_all_lookups())))
         btn_rel = QPushButton("+ Add Relationship")
         btn_rel.clicked.connect(self.add_rel_row)
         btn_layout.addWidget(btn_attr)
@@ -309,7 +327,7 @@ class ClassBuilderDialog(QDialog):
 
         splitter.addWidget(left_widget)
         splitter.addWidget(self.editor_widget)
-        splitter.setSizes([250, 650])
+        splitter.setSizes([250, 750])
 
         self.refresh_class_list()
         
@@ -317,6 +335,20 @@ class ClassBuilderDialog(QDialog):
         cur = self.db.cursor()
         cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
         return cur.fetchall()
+
+    def get_all_lookups(self):
+        """Fetches every existing attribute linked to its class name for the look-through dropdown."""
+        cur = self.db.cursor()
+        try:
+            cur.execute("""
+                SELECT c.name, a.name 
+                FROM classes c 
+                JOIN attributes a ON c.id = a.class_id
+                ORDER BY c.name ASC, a.name ASC
+            """)
+            return [f"{row[0]}.{row[1]}" for row in cur.fetchall()]
+        except sqlite3.OperationalError:
+            return []
 
     def refresh_class_list(self):
         """Builds the visual tree in the left sidebar based on paths."""
@@ -382,10 +414,12 @@ class ClassBuilderDialog(QDialog):
         row = cur.fetchone()
         self.class_name_input.setText(row[0])
         self.class_path_input.setText(row[1] if row[1] else "")
+        
+        valid_lookups = self.get_all_lookups()
 
-        cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
+        cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
         attributes = cur.fetchall()
-        for attr_id, attr_name, attr_type, show_in_table, is_title, is_unique, is_required in attributes:
+        for attr_id, attr_name, attr_type, show_in_table, is_title, is_unique, is_required, lookup_query in attributes:
             matrix_cols = []
             if attr_type == "matrix":
                 cur.execute("SELECT column_name FROM matrix_columns WHERE attribute_id = ? ORDER BY column_index", (attr_id,))
@@ -398,9 +432,10 @@ class ClassBuilderDialog(QDialog):
                 'show_in_table': show_in_table,
                 'is_title': is_title,
                 'is_unique': is_unique,
-                'is_required': is_required
+                'is_required': is_required,
+                'lookup_query': lookup_query if lookup_query else ''
             }
-            self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, attr_data))
+            self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data))
 
         cur.execute("SELECT target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
         for target, rel_type, show_in_table in cur.fetchall():
@@ -453,11 +488,12 @@ class ClassBuilderDialog(QDialog):
                     is_title = 1 if widget.title_cb.isChecked() else 0
                     is_unique = 1 if widget.unique_cb.isChecked() else 0
                     is_required = 1 if widget.req_cb.isChecked() else 0
+                    lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
                     
                     cur.execute("""
-                        INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required))
+                        INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required, lookup_query) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query))
                     new_attr_id = cur.lastrowid
 
                     if attr_type == "matrix":
