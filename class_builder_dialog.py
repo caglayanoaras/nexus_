@@ -24,6 +24,7 @@ def init_db(db_path=DB_NAME):
     """
     Creates the foundational database tables if they do not exist.
     This schema powers the entire meta-architecture of the Nexus app.
+    (Clean install mapping - No Legacy ALTER table fallbacks required)
     """
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = 1") # Enforces cascading deletes
@@ -43,7 +44,8 @@ def init_db(db_path=DB_NAME):
             show_in_table INTEGER DEFAULT 1,
             is_title INTEGER DEFAULT 0,
             is_unique INTEGER DEFAULT 0,
-            is_required INTEGER DEFAULT 0
+            is_required INTEGER DEFAULT 0,
+            lookup_query TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS matrix_columns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,19 +71,11 @@ def init_db(db_path=DB_NAME):
             code TEXT DEFAULT ''
         );
     """)
-    
-    # Safely upgrade existing schemas for look-through support
-    try:
-        cursor.execute("ALTER TABLE attributes ADD COLUMN lookup_query TEXT")
-    except sqlite3.OperationalError:
-        pass # Column already exists
-        
     conn.commit()
     return conn
 
 
 class ReorderableRow(QWidget):
-    """Base class providing Up/Down arrow functionality for UI rows."""
     def __init__(self, parent_layout):
         super().__init__()
         self.parent_layout = parent_layout
@@ -99,7 +93,6 @@ class ReorderableRow(QWidget):
             self.parent_layout.insertWidget(idx + 1, self)
 
 class AttributeRow(ReorderableRow):
-    """UI Widget representing a single attribute inside the Class Builder."""
     def __init__(self, parent_layout, valid_lookups=[], attr_data=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
@@ -107,7 +100,6 @@ class AttributeRow(ReorderableRow):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Reordering Buttons
         self.btn_up = QPushButton("\u25B2") 
         self.btn_up.setFixedWidth(25)
         self.btn_up.clicked.connect(self.move_up)
@@ -119,28 +111,24 @@ class AttributeRow(ReorderableRow):
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Attribute Name")
         
-        # Data Type Selection
         self.type_combo = QComboBox()
         self.type_combo.addItems([
             "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "look-through"
         ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         
-        # Look-through configuration input (Now a dropdown!)
         self.lookup_input = QComboBox()
-        self.lookup_input.setEditable(True) # Allows manual typing just in case
+        self.lookup_input.setEditable(True) 
         self.lookup_input.addItems(valid_lookups)
         self.lookup_input.setCurrentIndex(-1)
         self.lookup_input.setPlaceholderText("TargetClass.Attribute")
         self.lookup_input.setVisible(False)
         self.lookup_input.setToolTip("Select from existing attributes or type manually (TargetClass.Attribute)")
         
-        # Constraints and UI preferences
         self.show_cb = QCheckBox("Show")
         self.show_cb.setChecked(True)
         
         self.title_cb = QCheckBox("Title")
-        
         self.unique_cb = QCheckBox("Unique")
         self.req_cb = QCheckBox("Req.")
 
@@ -152,7 +140,6 @@ class AttributeRow(ReorderableRow):
         self.delete_btn.setFixedWidth(30)
         self.delete_btn.clicked.connect(self.deleteLater)
 
-        # Assemble layout
         layout.addWidget(self.btn_up)
         layout.addWidget(self.btn_down)
         layout.addWidget(self.name_input)
@@ -165,7 +152,6 @@ class AttributeRow(ReorderableRow):
         layout.addWidget(self.matrix_btn)
         layout.addWidget(self.delete_btn)
 
-        # Pre-fill if editing an existing class
         if attr_data:
             self.name_input.setText(attr_data['name'])
             self.type_combo.setCurrentText(attr_data['type'])
@@ -193,7 +179,6 @@ class AttributeRow(ReorderableRow):
 
 
 class RelationshipRow(ReorderableRow):
-    """UI Widget representing an outgoing relationship link to another class."""
     def __init__(self, parent_layout, valid_classes, rel_data=None):
         super().__init__(parent_layout)
         layout = QHBoxLayout(self)
@@ -238,7 +223,6 @@ class RelationshipRow(ReorderableRow):
 
 
 class ClassBuilderDialog(QDialog):
-    """The main dialog window for constructing and modifying database schemas."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nexus - Class Builder")
@@ -257,7 +241,6 @@ class ClassBuilderDialog(QDialog):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # LEFT WIDGET: Tree Directory
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         self.class_list_widget = QTreeWidget()
@@ -270,7 +253,6 @@ class ClassBuilderDialog(QDialog):
         left_layout.addWidget(self.class_list_widget)
         left_layout.addWidget(btn_add)
 
-        # RIGHT WIDGET: Class Editor
         self.editor_widget = QWidget()
         self.editor_layout = QVBoxLayout(self.editor_widget)
         self.editor_widget.setEnabled(False)
@@ -305,7 +287,6 @@ class ClassBuilderDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         btn_attr = QPushButton("+ Add Attribute")
-        # Generate the dropdown list on the fly whenever a new attribute is added
         btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.get_all_lookups())))
         btn_rel = QPushButton("+ Add Relationship")
         btn_rel.clicked.connect(self.add_rel_row)
@@ -337,7 +318,6 @@ class ClassBuilderDialog(QDialog):
         return cur.fetchall()
 
     def get_all_lookups(self):
-        """Fetches every existing attribute linked to its class name for the look-through dropdown."""
         cur = self.db.cursor()
         try:
             cur.execute("""
@@ -351,7 +331,6 @@ class ClassBuilderDialog(QDialog):
             return []
 
     def refresh_class_list(self):
-        """Builds the visual tree in the left sidebar based on paths."""
         self.class_list_widget.clear()
         
         root_items = {}
@@ -442,28 +421,79 @@ class ClassBuilderDialog(QDialog):
             valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
             self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'target_class': target, 'type': rel_type, 'show_in_table': show_in_table}))
 
+    def check_for_circular_dependencies(self, new_class_name):
+        """Builds a temporary look-through graph to prevent Infinite Recursion Loops."""
+        cur = self.db.cursor()
+        cur.execute("SELECT id, name FROM classes")
+        classes = {row[0]: row[1] for row in cur.fetchall()}
+        
+        temp_id = self.current_class_id if self.current_class_id else -1
+        classes[temp_id] = new_class_name
+        
+        graph = {cid: set() for cid in classes}
+        
+        # Load existing configurations
+        cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
+        for cid, lookup in cur.fetchall():
+            if cid == self.current_class_id: continue # We'll substitute unsaved UI values
+            tgt_name = lookup.split('.')[0].strip().lower()
+            for t_id, t_name in classes.items():
+                if t_name.lower() == tgt_name:
+                    graph[cid].add(t_id)
+
+        # Inject currently unsaved UI parameters
+        for i in range(self.attributes_layout.count()):
+            widget = self.attributes_layout.itemAt(i).widget()
+            if isinstance(widget, AttributeRow) and widget.type_combo.currentText() == "look-through":
+                lookup = widget.lookup_input.currentText().strip()
+                if lookup:
+                    tgt_name = lookup.split('.')[0].strip().lower()
+                    for t_id, t_name in classes.items():
+                        if t_name.lower() == tgt_name:
+                            graph[temp_id].add(t_id)
+
+        # Graph DFS cycle detection
+        visited = set()
+        temp_mark = set()
+        def visit(n):
+            if n in temp_mark: return True
+            if n not in visited:
+                temp_mark.add(n)
+                for m in graph.get(n, set()):
+                    if visit(m): return True
+                temp_mark.remove(n)
+                visited.add(n)
+            return False
+            
+        for node in graph:
+            if visit(node): return True
+        return False
+
     def save_class(self):
-        """Saves the class and its attributes into the meta-schema tables."""
         name = self.class_name_input.text().strip()
         path_val = self.class_path_input.text().strip()
         if not name:
             QMessageBox.warning(self, "Error", "Class name cannot be empty.")
             return
 
-        # ENFORCEMENT: Attribute names must be unique within a class.
         attr_names = set()
         for i in range(self.attributes_layout.count()):
             widget = self.attributes_layout.itemAt(i).widget()
             if isinstance(widget, AttributeRow):
                 attr_name = widget.name_input.text().strip()
                 if not attr_name: continue
-                
-                # Normalize name: "My Name" and "my_name" map to the same SQL column
                 safe_name = attr_name.replace(' ', '_').lower()
                 if safe_name in attr_names:
                     QMessageBox.warning(self, "Error", f"Duplicate attribute detected: '{attr_name}'. Attribute names must be unique.")
                     return
                 attr_names.add(safe_name)
+
+        if self.check_for_circular_dependencies(name):
+            QMessageBox.critical(self, "Circular Dependency Detected", 
+                "Cannot save class: This 'Look-Through' configuration creates an infinite circular loop.\n\n"
+                "For example: Class A looks through Class B, and Class B looks through Class A. "
+                "Please fix the routing architecture.")
+            return
 
         cur = self.db.cursor()
         try:
@@ -473,7 +503,6 @@ class ClassBuilderDialog(QDialog):
             else:
                 cur.execute("UPDATE classes SET name = ?, path = ? WHERE id = ?", (name, path_val, self.current_class_id))
             
-            # Wiping old schema rules and rebuilding them fresh ensures perfect sync
             cur.execute("DELETE FROM attributes WHERE class_id = ?", (self.current_class_id,))
             cur.execute("DELETE FROM relationships WHERE source_class = ?", (self.current_class_id,))
 

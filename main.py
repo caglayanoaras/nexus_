@@ -31,21 +31,16 @@ from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon
 # ==========================================
 def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     """
-    Reads the metadata schema from Class Builder and physically creates/updates 
-    the actual SQLite tables (e.g. objects_materials).
-    Also generates a massive SQL View that joins all the junction tables 
-    so you can view relationships easily.
+    Reads the metadata schema and updates the actual SQLite tables.
+    Generates a 3-Tier View Architecture:
+    1. base_view: Physical columns + Look-throughs (Allows infinite deep cascading without loops).
+    2. view: The UI table view (base_view + Relationships, respecting 'show_in_table').
+    3. full_view: The Omni-view for modules/export (base_view + Relationships, showing everything).
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     safe_table_name = f"objects_{class_name.replace(' ', '_').lower()}"
-    
-    # Ensure attributes schema is up to date dynamically for older databases
-    try:
-        cur.execute("ALTER TABLE attributes ADD COLUMN lookup_query TEXT")
-    except sqlite3.OperationalError:
-        pass
     
     # 1. FETCH METADATA
     cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
@@ -54,50 +49,18 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     required_cols = []
     attr_app_types = {}
     
-    select_clause = ["m.id AS [ID]"]
-    full_select_clause = ["m.id AS [ID]"]
-    
     for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
         safe_col_name = attr_name.replace(' ', '_').lower()
-        
-        # HANDLE VIRTUAL 'LOOK-THROUGH' ATTRIBUTES
         if attr_type == "look-through":
-            if lookup_query:
-                try:
-                    tgt_class, tgt_attr = lookup_query.split('.')
-                    safe_tgt_class = tgt_class.strip().replace(' ', '_').lower()
-                    safe_tgt_attr = tgt_attr.strip().replace(' ', '_').lower()
-                    
-                    junc_table = f"rel_{safe_table_name}_to_objects_{safe_tgt_class}"
-                    # Lookup retrieves exact value directly from the physical target table via junction
-                    subquery = f"(SELECT GROUP_CONCAT(tgt.[{safe_tgt_attr}]) FROM {junc_table} j JOIN objects_{safe_tgt_class} tgt ON j.target_id = tgt.id WHERE j.source_id = m.id)"
-                    if show_in_table:
-                        select_clause.append(f"{subquery} AS [{attr_name}]")
-                    full_select_clause.append(f"{subquery} AS [{attr_name}]")
-                except Exception:
-                    # Failsafe if string format is invalid
-                    if show_in_table:
-                        select_clause.append(f"NULL AS [{attr_name}]")
-                    full_select_clause.append(f"NULL AS [{attr_name}]")
-            
-            # Record type but do NOT append to required_cols because it's completely virtual!
             attr_app_types[safe_col_name] = attr_type
             continue
 
-        # MAP APP DATA TYPES TO SQLITE DATA TYPES
-        if attr_type in ("int", "boolean"):
-            sql_type = "INTEGER"
-        elif attr_type == "float":
-            sql_type = "REAL"
-        else:
-            sql_type = "TEXT"
+        if attr_type in ("int", "boolean"): sql_type = "INTEGER"
+        elif attr_type == "float": sql_type = "REAL"
+        else: sql_type = "TEXT"
             
         required_cols.append((safe_col_name, sql_type))
         attr_app_types[safe_col_name] = attr_type
-        
-        if show_in_table:
-            select_clause.append(f"m.[{safe_col_name}] AS [{attr_name}]")
-        full_select_clause.append(f"m.[{safe_col_name}] AS [{attr_name}]")
 
     # 2. CREATE OR UPDATE PRIMARY TABLE
     cur.execute(f"SELECT count(name) FROM sqlite_master WHERE type='table' AND name='{safe_table_name}'")
@@ -159,9 +122,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             conn.commit()
             conn.execute("PRAGMA foreign_keys = OFF")
             
-            view_name = f"view_{safe_table_name}"
-            cur.execute(f"DROP VIEW IF EXISTS {view_name}")
-            
             new_table = f"new_{safe_table_name}"
             cur.execute(f"DROP TABLE IF EXISTS {new_table}")
             
@@ -216,132 +176,102 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 if col_name not in existing_cols:
                     cur.execute(f"ALTER TABLE {safe_table_name} ADD COLUMN [{col_name}] {col_type}")
 
-    # 3. GENERATE JUNCTION TABLES (Flattened logic preventing Circular Dependencies)
-    cur.execute("""
-        SELECT c.name, r.rel_type, c.id, r.show_in_table 
-        FROM relationships r JOIN classes c ON r.target_class = c.id 
-        WHERE r.source_class = ? ORDER BY r.row_order
-    """, (class_id,))
+    # 3. ENSURE JUNCTION TABLES EXIST 
+    cur.execute("SELECT c.name, r.rel_type, c.id, r.show_in_table FROM relationships r JOIN classes c ON r.target_class = c.id WHERE r.source_class = ? ORDER BY r.row_order", (class_id,))
     outgoing_rels = cur.fetchall()
     
     for target_name, rel_type, target_class_id, show_in_table in outgoing_rels:
         safe_target_name = target_name.replace(' ', '_').lower()
         cur.execute(f"CREATE TABLE IF NOT EXISTS objects_{safe_target_name} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
         junc_table = f"rel_{safe_table_name}_to_objects_{safe_target_name}"
-        
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {junc_table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id INTEGER,
-                target_id INTEGER,
-                FOREIGN KEY(source_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE,
-                FOREIGN KEY(target_id) REFERENCES objects_{safe_target_name}(id) ON DELETE CASCADE
-            )
-        """)
-        
-        cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
-        title_rows = cur.fetchall()
-        if title_rows:
-            for t_name, t_type, t_lookup in title_rows:
-                display_label = f"[{target_name} ({t_name})]"
-                if t_type == "look-through" and t_lookup:
-                    try:
-                        tgt_tgt_class, tgt_tgt_attr = t_lookup.split('.')
-                        safe_tgt_tgt_class = tgt_tgt_class.strip().replace(' ', '_').lower()
-                        safe_tgt_tgt_attr = tgt_tgt_attr.strip().replace(' ', '_').lower()
-                        
-                        junc_bc = f"rel_objects_{safe_target_name}_to_objects_{safe_tgt_tgt_class}"
-                        # Join physical tables explicitly
-                        subquery = f"(SELECT GROUP_CONCAT(tgt_tgt.[{safe_tgt_tgt_attr}]) FROM {junc_table} j_ab JOIN {junc_bc} j_bc ON j_ab.target_id = j_bc.source_id JOIN objects_{safe_tgt_tgt_class} tgt_tgt ON j_bc.target_id = tgt_tgt.id WHERE j_ab.source_id = m.id)"
-                        if show_in_table:
-                            select_clause.append(f"{subquery} AS {display_label}")
-                        full_select_clause.append(f"{subquery} AS {display_label}")
-                    except Exception:
-                        if show_in_table:
-                            select_clause.append(f"NULL AS {display_label}")
-                        full_select_clause.append(f"NULL AS {display_label}")
-                else:
-                    safe_t_name = t_name.replace(' ', '_').lower()
-                    # Join physical tables explicitly
-                    query_str = f"(SELECT GROUP_CONCAT(t.[{safe_t_name}]) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}"
-                    if show_in_table:
-                        select_clause.append(query_str)
-                    full_select_clause.append(query_str)
-        else:
-            display_label = f"[{target_name} (IDs)]"
-            query_str = f"(SELECT GROUP_CONCAT(t.id) FROM {junc_table} j JOIN objects_{safe_target_name} t ON j.target_id = t.id WHERE j.source_id = m.id) AS {display_label}"
-            if show_in_table:
-                select_clause.append(query_str)
-            full_select_clause.append(query_str)
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {junc_table} (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, target_id INTEGER, FOREIGN KEY(source_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES objects_{safe_target_name}(id) ON DELETE CASCADE)")
 
-    cur.execute("""
-        SELECT c.name, r.rel_type, c.id, r.show_in_table 
-        FROM relationships r JOIN classes c ON r.source_class = c.id 
-        WHERE r.target_class = ? ORDER BY r.row_order
-    """, (class_id,))
+    cur.execute("SELECT c.name, r.rel_type, c.id, r.show_in_table FROM relationships r JOIN classes c ON r.source_class = c.id WHERE r.target_class = ? ORDER BY r.row_order", (class_id,))
     incoming_rels = cur.fetchall()
 
     for source_name, rel_type, source_class_id, show_in_table in incoming_rels:
         safe_source_name = source_name.replace(' ', '_').lower()
         cur.execute(f"CREATE TABLE IF NOT EXISTS objects_{safe_source_name} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
         junc_table = f"rel_objects_{safe_source_name}_to_{safe_table_name}"
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {junc_table} (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, target_id INTEGER, FOREIGN KEY(source_id) REFERENCES objects_{safe_source_name}(id) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE)")
+
+    # 4. TIER 1: BASE VIEW (Physical Columns + Deep Cascading Look-Throughs)
+    base_selects = ["m.id AS [ID]"]
+    for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
+        safe_col_name = attr_name.replace(' ', '_').lower()
+        if attr_type == "look-through":
+            if lookup_query:
+                parts = lookup_query.split('.')
+                if len(parts) == 2:
+                    tgt_class, tgt_attr = parts
+                    safe_tgt_class = tgt_class.strip().replace(' ', '_').lower()
+                    junc_table = f"rel_{safe_table_name}_to_objects_{safe_tgt_class}"
+                    # Base View queries Base View of the target - allowing infinite depth!
+                    subquery = f"(SELECT GROUP_CONCAT(tgt_v.[{tgt_attr.strip()}]) FROM {junc_table} j JOIN base_view_{safe_tgt_class} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = m.id)"
+                    base_selects.append(f"{subquery} AS [{attr_name}]")
+                else:
+                    raise ValueError(f"Invalid lookup format '{lookup_query}'. Expected 'TargetClass.Attribute'.")
+            else:
+                base_selects.append(f"NULL AS [{attr_name}]")
+        else:
+            base_selects.append(f"m.[{safe_col_name}] AS [{attr_name}]")
+
+    base_view_name = f"base_view_{safe_table_name}"
+    cur.execute(f"DROP VIEW IF EXISTS {base_view_name}")
+    cur.execute(f"CREATE VIEW {base_view_name} AS SELECT {', '.join(base_selects)} FROM {safe_table_name} m")
+
+    # 5. TIER 2 & 3: UI VIEW AND FULL (OMNI) VIEW (Resolves Relationships)
+    ui_selects = ["v.[ID]"]
+    full_selects = ["v.[ID]"]
+
+    for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
+        col_sql = f"v.[{attr_name}]"
+        if show_in_table: ui_selects.append(col_sql)
+        full_selects.append(col_sql)
+
+    for target_name, rel_type, target_class_id, show_in_table in outgoing_rels:
+        safe_target_name = target_name.replace(' ', '_').lower()
+        junc_table = f"rel_{safe_table_name}_to_objects_{safe_target_name}"
         
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {junc_table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id INTEGER,
-                target_id INTEGER,
-                FOREIGN KEY(source_id) REFERENCES objects_{safe_source_name}(id) ON DELETE CASCADE,
-                FOREIGN KEY(target_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE
-            )
-        """)
-        
-        cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
+        cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
         title_rows = cur.fetchall()
         if title_rows:
-            for t_name, t_type, t_lookup in title_rows:
+            for (t_name,) in title_rows:
+                display_label = f"[{target_name} ({t_name})]"
+                query_str = f"(SELECT GROUP_CONCAT(tgt_v.[{t_name}]) FROM {junc_table} j JOIN base_view_{safe_target_name} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = v.[ID]) AS {display_label}"
+                if show_in_table: ui_selects.append(query_str)
+                full_selects.append(query_str)
+        else:
+            display_label = f"[{target_name} (IDs)]"
+            query_str = f"(SELECT GROUP_CONCAT(j.target_id) FROM {junc_table} j WHERE j.source_id = v.[ID]) AS {display_label}"
+            if show_in_table: ui_selects.append(query_str)
+            full_selects.append(query_str)
+
+    for source_name, rel_type, source_class_id, show_in_table in incoming_rels:
+        safe_source_name = source_name.replace(' ', '_').lower()
+        junc_table = f"rel_objects_{safe_source_name}_to_{safe_table_name}"
+        
+        cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
+        title_rows = cur.fetchall()
+        if title_rows:
+            for (t_name,) in title_rows:
                 display_label = f"[From {source_name} ({t_name})]"
-                if t_type == "look-through" and t_lookup:
-                    try:
-                        tgt_tgt_class, tgt_tgt_attr = t_lookup.split('.')
-                        safe_tgt_tgt_class = tgt_tgt_class.strip().replace(' ', '_').lower()
-                        safe_tgt_tgt_attr = tgt_tgt_attr.strip().replace(' ', '_').lower()
-                        
-                        junc_sc = f"rel_objects_{safe_source_name}_to_objects_{safe_tgt_tgt_class}"
-                        # Join physical tables explicitly
-                        subquery = f"(SELECT GROUP_CONCAT(tgt_tgt.[{safe_tgt_tgt_attr}]) FROM {junc_table} j_ab JOIN {junc_sc} j_sc ON j_ab.source_id = j_sc.source_id JOIN objects_{safe_tgt_tgt_class} tgt_tgt ON j_sc.target_id = tgt_tgt.id WHERE j_ab.target_id = m.id)"
-                        if show_in_table:
-                            select_clause.append(f"{subquery} AS {display_label}")
-                        full_select_clause.append(f"{subquery} AS {display_label}")
-                    except Exception:
-                        if show_in_table:
-                            select_clause.append(f"NULL AS {display_label}")
-                        full_select_clause.append(f"NULL AS {display_label}")
-                else:
-                    safe_t_name = t_name.replace(' ', '_').lower()
-                    # Join physical tables explicitly
-                    query_str = f"(SELECT GROUP_CONCAT(t.[{safe_t_name}]) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}"
-                    if show_in_table:
-                        select_clause.append(query_str)
-                    full_select_clause.append(query_str)
+                query_str = f"(SELECT GROUP_CONCAT(src_v.[{t_name}]) FROM {junc_table} j JOIN base_view_{safe_source_name} src_v ON j.source_id = src_v.[ID] WHERE j.target_id = v.[ID]) AS {display_label}"
+                if show_in_table: ui_selects.append(query_str)
+                full_selects.append(query_str)
         else:
             display_label = f"[From {source_name} (IDs)]"
-            query_str = f"(SELECT GROUP_CONCAT(t.id) FROM {junc_table} j JOIN objects_{safe_source_name} t ON j.source_id = t.id WHERE j.target_id = m.id) AS {display_label}"
-            if show_in_table:
-                select_clause.append(query_str)
-            full_select_clause.append(query_str)
-            
-    # 4. RE-GENERATE DYNAMIC SQL VIEW 
+            query_str = f"(SELECT GROUP_CONCAT(j.source_id) FROM {junc_table} j WHERE j.target_id = v.[ID]) AS {display_label}"
+            if show_in_table: ui_selects.append(query_str)
+            full_selects.append(query_str)
+
     view_name = f"view_{safe_table_name}"
     cur.execute(f"DROP VIEW IF EXISTS {view_name}")
-    view_sql = f"CREATE VIEW {view_name} AS SELECT {', '.join(select_clause)} FROM {safe_table_name} m"
-    cur.execute(view_sql)
+    cur.execute(f"CREATE VIEW {view_name} AS SELECT {', '.join(ui_selects)} FROM {base_view_name} v")
 
-    # 5. GENERATE A FULL OMNI-VIEW FOR DATA EXPORT/MODULES
     full_view_name = f"full_view_{safe_table_name}"
     cur.execute(f"DROP VIEW IF EXISTS {full_view_name}")
-    full_view_sql = f"CREATE VIEW {full_view_name} AS SELECT {', '.join(full_select_clause)} FROM {safe_table_name} m"
-    cur.execute(full_view_sql)
+    cur.execute(f"CREATE VIEW {full_view_name} AS SELECT {', '.join(full_selects)} FROM {base_view_name} v")
 
     conn.commit()
     conn.close()
@@ -391,7 +321,6 @@ class ObjectEditorDialog(QDialog):
         for attr_id, attr_name, attr_type, is_unique, is_required in attributes:
             safe_col_name = attr_name.replace(' ', '_').lower()
             
-            # Virtual look-through fields shouldn't have manual input boxes
             if attr_type == "look-through":
                 continue
                 
@@ -466,15 +395,15 @@ class ObjectEditorDialog(QDialog):
                 
             list_widget.setMinimumHeight(120) 
             
-            cur.execute("SELECT name, data_type, lookup_query FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
+            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
             title_rows = cur.fetchall()
             
             try:
                 if title_rows:
                     title_cols = [r[0] for r in title_rows] 
                     escaped_cols = ", ".join([f"[{c}]" for c in title_cols])
-                    # Query directly from View so derived Look-through titles resolve beautifully!
-                    cur.execute(f"SELECT [ID], {escaped_cols} FROM view_objects_{safe_target_name}")
+                    # Query directly from base_view to guarantee resolving physical AND look-through titles perfectly
+                    cur.execute(f"SELECT [ID], {escaped_cols} FROM base_view_{safe_target_name}")
                     
                     for row in cur.fetchall():
                         t_id = row[0]
@@ -495,7 +424,7 @@ class ObjectEditorDialog(QDialog):
                         item.setData(Qt.UserRole + 1, search_text_data)
                         list_widget.addItem(item)
                 else:
-                    cur.execute(f"SELECT [ID] FROM view_objects_{safe_target_name}")
+                    cur.execute(f"SELECT [ID] FROM base_view_{safe_target_name}")
                     for row in cur.fetchall():
                         t_id = row[0]
                         item = QListWidgetItem(f"{target_name} #{t_id}")
@@ -702,7 +631,6 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
         
-        # --- Database Tab ---
         db_tab = QWidget()
         db_layout = QVBoxLayout(db_tab)
         db_layout.addWidget(QLabel("Database Path:"))
@@ -728,7 +656,6 @@ class SettingsDialog(QDialog):
         db_layout.addLayout(btn_db_layout)
         self.tabs.addTab(db_tab, "Database")
 
-        # --- Modules Tab ---
         mod_tab = QWidget()
         mod_layout = QVBoxLayout(mod_tab)
         mod_layout.addWidget(QLabel("Module Output File Path:"))
@@ -737,7 +664,6 @@ class SettingsDialog(QDialog):
         self.output_input = QLineEdit()
         
         db_path = self.settings.value("db_path", "")
-        # Dynamically set default path to exactly where the database is
         if db_path and os.path.exists(os.path.dirname(db_path)):
             default_out = os.path.join(os.path.dirname(db_path), "module_output.txt")
         else:
@@ -801,7 +727,6 @@ class ModuleBuilderDialog(QDialog):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
         
-        # LEFT WIDGET: Tree Directory
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         self.module_list_widget = QTreeWidget()
@@ -814,12 +739,10 @@ class ModuleBuilderDialog(QDialog):
         left_layout.addWidget(self.module_list_widget)
         left_layout.addWidget(btn_add)
         
-        # RIGHT WIDGET: Module Editor
         self.editor_widget = QWidget()
         self.editor_layout = QVBoxLayout(self.editor_widget)
         self.editor_widget.setEnabled(False)
         
-        # Info row
         info_layout = QHBoxLayout()
         self.module_name_input = QLineEdit()
         self.module_name_input.setPlaceholderText("Module Name")
@@ -831,7 +754,6 @@ class ModuleBuilderDialog(QDialog):
         info_layout.addWidget(self.module_path_input)
         self.editor_layout.addLayout(info_layout)
         
-        # Editor
         self.editor = QPlainTextEdit()
         font = self.editor.font()
         font.setFamily("Courier New")
@@ -842,7 +764,6 @@ class ModuleBuilderDialog(QDialog):
         self.editor_layout.addWidget(QLabel("Python Script Editor:"))
         self.editor_layout.addWidget(self.editor)
         
-        # Bottom Buttons
         btn_layout = QHBoxLayout()
         
         btn_delete = QPushButton("Delete Module")
@@ -994,7 +915,6 @@ class ModuleBuilderDialog(QDialog):
             self.refresh_module_list()
 
     def get_objects(self, class_name):
-        """Helper API to fetch the full SQL view of a class as a DataFrame."""
         if pd is None:
             raise ImportError("Pandas library is not installed.")
             
@@ -1051,6 +971,8 @@ class DataBrowserPage(QWidget):
         self.current_view_name = None
         self.current_table_name = None
         self.db_path = ""
+        
+        self.hidden_columns_memory = {} # New memory bank for hidden columns by name
         
         self.page_size = 100
         self.current_page = 0
@@ -1123,7 +1045,6 @@ class DataBrowserPage(QWidget):
         header.setStretchLastSection(True)
         header.sortIndicatorChanged.connect(self.on_sort_changed)
         
-        # Enable Right-Click to hide specific columns temporarily
         header.setContextMenuPolicy(Qt.CustomContextMenu)
         header.customContextMenuRequested.connect(self.show_header_context_menu)
         
@@ -1168,8 +1089,17 @@ class DataBrowserPage(QWidget):
         self.btn_delete.setEnabled(False)
         
         self.db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
-        self.current_view_name, self.current_table_name = sync_physical_table(self.db_path, class_id, class_name, parent_widget=self)
         
+        # ERROR AGGREGATION at the Table Generation level
+        try:
+            self.current_view_name, self.current_table_name = sync_physical_table(self.db_path, class_id, class_name, parent_widget=self)
+        except Exception as e:
+            QMessageBox.critical(self, "Schema Load Error", f"Failed to generate table data for '{class_name}'.\n\nEnsure there are no broken links in the class configuration.\n\nDetails:\n{str(e)}")
+            self.header_label.setText("<h2>Sync Aborted</h2>")
+            self.btn_import.setEnabled(False)
+            self.btn_add.setEnabled(False)
+            return
+            
         if not self.current_view_name:
             self.header_label.setText("<h2>Sync Aborted</h2>")
             self.btn_import.setEnabled(False)
@@ -1249,6 +1179,15 @@ class DataBrowserPage(QWidget):
         
         self.query_model.setQuery(query)
         
+        # Apply hidden columns memory by checking actual column names
+        hidden_for_class = self.hidden_columns_memory.get(self.current_class_name, set())
+        for i in range(self.query_model.columnCount()):
+            col_name = self.query_model.headerData(i, Qt.Horizontal)
+            if col_name in hidden_for_class:
+                self.table_view.setColumnHidden(i, True)
+            else:
+                self.table_view.setColumnHidden(i, False)
+        
         self.page_label.setText(f"Page {self.current_page + 1} of {self.total_pages} (Total: {self.total_records})")
         self.btn_prev.setEnabled(self.current_page > 0)
         self.btn_next.setEnabled(self.current_page < self.total_pages - 1)
@@ -1300,17 +1239,14 @@ class DataBrowserPage(QWidget):
         
         menu = QMenu()
         
-        # 1. Action to hide the specific column clicked
         act_hide = None
         if logical_index >= 0:
             col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
             if col_name:
-                # Safety check: prevent hiding the very last visible column!
                 visible_count = sum(1 for i in range(header.count()) if not self.table_view.isColumnHidden(i))
                 if visible_count > 1:
                     act_hide = menu.addAction(f"Hide '{col_name}' Temporarily")
         
-        # 2. Action to unhide all columns (if any are currently hidden)
         hidden_cols = [i for i in range(header.count()) if self.table_view.isColumnHidden(i)]
         act_unhide = None
         if hidden_cols:
@@ -1325,9 +1261,14 @@ class DataBrowserPage(QWidget):
         
         if act_hide and action == act_hide:
             self.table_view.setColumnHidden(logical_index, True)
+            col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
+            if col_name:
+                self.hidden_columns_memory.setdefault(self.current_class_name, set()).add(col_name)
         elif act_unhide and action == act_unhide:
             for i in range(header.count()):
                 self.table_view.setColumnHidden(i, False)
+            if self.current_class_name in self.hidden_columns_memory:
+                self.hidden_columns_memory[self.current_class_name].clear()
 
     def show_context_menu(self, position):
         if not self.table_view.selectionModel().selectedRows():
@@ -1675,43 +1616,84 @@ class MainWindow(QWidget):
 
     def sync_all_classes(self, db_path):
         """
-        Runs on startup to ensure all tables & views physically exist so that cross-view
-        dependencies (like Look-through titles) evaluate smoothly without missing table errors.
+        Runs on startup. Resolves 'Look-through' dependencies via a TOPOLOGICAL SORT, 
+        ensuring classes are synchronized in their exact dependency order.
+        Aggregates operational SQL errors and surfaces them to the user.
         """
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
+        
+        # 1. Gather all classes
         try:
             cur.execute("SELECT id, name FROM classes")
-            classes = cur.fetchall()
+            classes = {row[0]: row[1] for row in cur.fetchall()}
         except sqlite3.OperationalError:
-            classes = []
+            classes = {}
+            
+        # 2. Build Dependency Graph (A depends on B if A looks through to B)
+        dependencies = {cid: set() for cid in classes}
+        try:
+            cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
+            for cid, lookup in cur.fetchall():
+                if lookup:
+                    tgt_class_name = lookup.split('.')[0].strip().lower()
+                    for t_id, t_name in classes.items():
+                        if t_name.lower() == tgt_class_name:
+                            dependencies[cid].add(t_id)
+        except sqlite3.OperationalError:
+            pass # Schema not fully created yet
+            
+        # 3. Topological Sort (Kahn's / DFS approach)
+        ordered_cids = []
+        visited = set()
+        temp_mark = set()
+        cycle_detected = False
+        
+        def visit(n):
+            if n in temp_mark: return False # Cycle
+            if n not in visited:
+                temp_mark.add(n)
+                for m in dependencies.get(n, set()):
+                    if m in classes and not visit(m): return False
+                temp_mark.remove(n)
+                visited.add(n)
+                ordered_cids.append(n)
+            return True
+            
+        for cid in classes:
+            if cid not in visited:
+                if not visit(cid):
+                    cycle_detected = True
+                    break
+                    
+        if cycle_detected:
+            # Failsafe if the Builder cycle detection was bypassed somehow
+            ordered_cids = list(classes.keys())
+            
         conn.close()
         
-        # Max 3 passes to naturally resolve generated views referencing other views
-        for _ in range(3):
-            all_success = True
-            for cid, cname in classes:
-                try:
-                    sync_physical_table(db_path, cid, cname)
-                except sqlite3.OperationalError as e:
-                    if "no such" in str(e).lower() or "no such column" in str(e).lower():
-                        all_success = False
-                    else:
-                        pass # Ignore other operational errors during syncing pass
-            if all_success:
-                break
+        # 4. Sync Sequentially & Aggregate Errors
+        sync_errors = []
+        for cid in ordered_cids:
+            try:
+                sync_physical_table(db_path, cid, classes[cid], parent_widget=self)
+            except Exception as e:
+                sync_errors.append(f"Class '{classes[cid]}': {str(e)}")
+                
+        # 5. UI ERROR AGGREGATION NOTIFICATION
+        if sync_errors:
+            error_msg = "The following configuration errors were detected during sync. Some views might not load perfectly until you fix their schemas:\n\n" + "\n".join(sync_errors)
+            QMessageBox.warning(self, "Database Schema Warnings", error_msg)
 
     def refresh_sidebar(self):
         self.sidebar.clear()
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         db_path = settings.value("db_path", "")
         
-        # Auto-connect handling: Define a default if completely empty
         if not db_path:
             db_path = os.path.join(os.path.expanduser("~"), "nexus_default.db")
             settings.setValue("db_path", db_path)
             
-        # Ensure the fallback / new path physical DB actually initializes
         if not os.path.exists(db_path):
             init_db(db_path)
 
@@ -1722,7 +1704,6 @@ class MainWindow(QWidget):
         db.setDatabaseName(db_path)
         if not db.open(): return
 
-        # Pre-generate dynamic views to guarantee cross-linking schema integrity
         self.sync_all_classes(db_path)
 
         conn = sqlite3.connect(db_path)
