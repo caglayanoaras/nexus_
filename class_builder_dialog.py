@@ -1,6 +1,8 @@
 import sys
 import sqlite3
 import os
+import re
+import qtawesome as qta
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QPushButton, QLineEdit, QLabel, QTableView, 
@@ -17,17 +19,16 @@ def get_app_icon():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return QIcon(os.path.join(base_dir, "resources", "app_image.ico"))
 
-# ==========================================
-# DATABASE INITIALIZATION
-# ==========================================
+def sanitize_name(name):
+    if not name: return "unnamed"
+    safe = re.sub(r'[^\w]', '_', str(name)).lower()
+    safe = re.sub(r'_+', '_', safe).strip('_')
+    if safe and safe[0].isdigit(): safe = "n_" + safe
+    return safe if safe else "unnamed"
+
 def init_db(db_path=DB_NAME):
-    """
-    Creates the foundational database tables if they do not exist.
-    This schema powers the entire meta-architecture of the Nexus app.
-    (Clean install mapping - No Legacy ALTER table fallbacks required)
-    """
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = 1") # Enforces cascading deletes
+    conn.execute("PRAGMA foreign_keys = 1")
     cursor = conn.cursor()
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS classes (
@@ -74,7 +75,6 @@ def init_db(db_path=DB_NAME):
     conn.commit()
     return conn
 
-
 class ReorderableRow(QWidget):
     def __init__(self, parent_layout):
         super().__init__()
@@ -96,16 +96,19 @@ class AttributeRow(ReorderableRow):
     def __init__(self, parent_layout, valid_lookups=[], attr_data=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
+        self.attr_id = attr_data.get('id') if attr_data else None
         
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_up = QPushButton("\u25B2") 
-        self.btn_up.setFixedWidth(25)
+        self.btn_up = QPushButton() 
+        self.btn_up.setIcon(qta.icon('fa5s.arrow-up', color='gray'))
+        self.btn_up.setFixedWidth(30)
         self.btn_up.clicked.connect(self.move_up)
         
-        self.btn_down = QPushButton("\u25BC") 
-        self.btn_down.setFixedWidth(25)
+        self.btn_down = QPushButton() 
+        self.btn_down.setIcon(qta.icon('fa5s.arrow-down', color='gray'))
+        self.btn_down.setFixedWidth(30)
         self.btn_down.clicked.connect(self.move_down)
 
         self.name_input = QLineEdit()
@@ -136,7 +139,8 @@ class AttributeRow(ReorderableRow):
         self.matrix_btn.setVisible(False)
         self.matrix_btn.clicked.connect(self.set_matrix_columns)
 
-        self.delete_btn = QPushButton("X")
+        self.delete_btn = QPushButton()
+        self.delete_btn.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
         self.delete_btn.setFixedWidth(30)
         self.delete_btn.clicked.connect(self.deleteLater)
 
@@ -181,15 +185,19 @@ class AttributeRow(ReorderableRow):
 class RelationshipRow(ReorderableRow):
     def __init__(self, parent_layout, valid_classes, rel_data=None):
         super().__init__(parent_layout)
+        self.rel_id = rel_data.get('id') if rel_data else None
+        
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_up = QPushButton("\u25B2") 
-        self.btn_up.setFixedWidth(25)
+        self.btn_up = QPushButton() 
+        self.btn_up.setIcon(qta.icon('fa5s.arrow-up', color='gray'))
+        self.btn_up.setFixedWidth(30)
         self.btn_up.clicked.connect(self.move_up)
         
-        self.btn_down = QPushButton("\u25BC") 
-        self.btn_down.setFixedWidth(25)
+        self.btn_down = QPushButton() 
+        self.btn_down.setIcon(qta.icon('fa5s.arrow-down', color='gray'))
+        self.btn_down.setFixedWidth(30)
         self.btn_down.clicked.connect(self.move_down)
 
         self.target_combo = QComboBox()
@@ -202,7 +210,8 @@ class RelationshipRow(ReorderableRow):
         self.show_cb = QCheckBox("Show in Table")
         self.show_cb.setChecked(True)
         
-        self.delete_btn = QPushButton("X")
+        self.delete_btn = QPushButton()
+        self.delete_btn.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
         self.delete_btn.setFixedWidth(30)
         self.delete_btn.clicked.connect(self.deleteLater)
 
@@ -220,7 +229,6 @@ class RelationshipRow(ReorderableRow):
                 self.target_combo.setCurrentIndex(idx)
             self.type_combo.setCurrentText(rel_data['type'])
             self.show_cb.setChecked(bool(rel_data.get('show_in_table', 1)))
-
 
 class ClassBuilderDialog(QDialog):
     def __init__(self, parent=None):
@@ -247,8 +255,10 @@ class ClassBuilderDialog(QDialog):
         self.class_list_widget.setHeaderHidden(True)
         self.class_list_widget.itemClicked.connect(self.load_class)
         
-        btn_add = QPushButton("Create New Class")
+        btn_add = QPushButton(" Create New Class")
+        btn_add.setIcon(qta.icon('fa5s.plus-circle'))
         btn_add.clicked.connect(self.create_new_class)
+        
         left_layout.addWidget(QLabel("<b>Classes</b>"))
         left_layout.addWidget(self.class_list_widget)
         left_layout.addWidget(btn_add)
@@ -286,19 +296,25 @@ class ClassBuilderDialog(QDialog):
         self.scroll_layout.addLayout(self.relationships_layout)
 
         btn_layout = QHBoxLayout()
-        btn_attr = QPushButton("+ Add Attribute")
+        btn_attr = QPushButton(" Add Attribute")
+        btn_attr.setIcon(qta.icon('fa5s.plus'))
         btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.get_all_lookups())))
-        btn_rel = QPushButton("+ Add Relationship")
+        
+        btn_rel = QPushButton(" Add Relationship")
+        btn_rel.setIcon(qta.icon('fa5s.plus'))
         btn_rel.clicked.connect(self.add_rel_row)
+        
         btn_layout.addWidget(btn_attr)
         btn_layout.addWidget(btn_rel)
         self.editor_layout.addLayout(btn_layout)
 
         action_layout = QHBoxLayout()
-        btn_save = QPushButton("Save Class")
+        btn_save = QPushButton(" Save Class")
+        btn_save.setIcon(qta.icon('fa5s.save'))
         btn_save.clicked.connect(self.save_class)
         
-        btn_delete = QPushButton("Delete Class")
+        btn_delete = QPushButton(" Delete Class")
+        btn_delete.setIcon(qta.icon('fa5s.trash-alt', color='white'))
         btn_delete.setStyleSheet("background-color: #ff4c4c; color: white;")
         btn_delete.clicked.connect(self.delete_class)
         
@@ -314,8 +330,13 @@ class ClassBuilderDialog(QDialog):
         
     def get_all_classes(self):
         cur = self.db.cursor()
-        cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
-        return cur.fetchall()
+        try:
+            cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
+            return cur.fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e).lower():
+                QMessageBox.warning(self, "Database Error", f"Error loading classes: {e}")
+            return []
 
     def get_all_lookups(self):
         cur = self.db.cursor()
@@ -327,7 +348,9 @@ class ClassBuilderDialog(QDialog):
                 ORDER BY c.name ASC, a.name ASC
             """)
             return [f"{row[0]}.{row[1]}" for row in cur.fetchall()]
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e).lower():
+                QMessageBox.warning(self, "Database Error", f"Error loading lookups: {e}")
             return []
 
     def refresh_class_list(self):
@@ -348,13 +371,15 @@ class ClassBuilderDialog(QDialog):
                     current_path = f"{current_path}/{part}" if current_path else part
                     
                     if current_path not in root_items:
-                        folder_item = QTreeWidgetItem([f"\U0001F4C1 {part}"])
+                        folder_item = QTreeWidgetItem([part])
+                        folder_item.setIcon(0, qta.icon('fa5s.folder', color='#FFC107'))
                         current_parent.addChild(folder_item)
                         root_items[current_path] = folder_item
                     
                     current_parent = root_items[current_path]
             
-            item = QTreeWidgetItem([f"\U0001F4C4 {cname}"])
+            item = QTreeWidgetItem([cname])
+            item.setIcon(0, qta.icon('fa5s.file-alt', color='#4CAF50'))
             item.setData(0, Qt.UserRole, cid)
             current_parent.addChild(item)
             
@@ -380,8 +405,7 @@ class ClassBuilderDialog(QDialog):
 
     def load_class(self, item, column=0):
         cid = item.data(0, Qt.UserRole)
-        if not cid: 
-            return 
+        if not cid: return 
             
         self.current_class_id = cid
         self.editor_widget.setEnabled(True)
@@ -405,6 +429,7 @@ class ClassBuilderDialog(QDialog):
                 matrix_cols = [row[0] for row in cur.fetchall()]
             
             attr_data = {
+                'id': attr_id,
                 'name': attr_name, 
                 'type': attr_type, 
                 'matrix_cols': matrix_cols,
@@ -416,32 +441,27 @@ class ClassBuilderDialog(QDialog):
             }
             self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data))
 
-        cur.execute("SELECT target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
-        for target, rel_type, show_in_table in cur.fetchall():
+        cur.execute("SELECT id, target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
+        for rel_id, target, rel_type, show_in_table in cur.fetchall():
             valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
-            self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'target_class': target, 'type': rel_type, 'show_in_table': show_in_table}))
+            self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_table': show_in_table}))
 
     def check_for_circular_dependencies(self, new_class_name):
-        """Builds a temporary look-through graph to prevent Infinite Recursion Loops."""
         cur = self.db.cursor()
         cur.execute("SELECT id, name FROM classes")
         classes = {row[0]: row[1] for row in cur.fetchall()}
         
         temp_id = self.current_class_id if self.current_class_id else -1
         classes[temp_id] = new_class_name
-        
         graph = {cid: set() for cid in classes}
         
-        # Load existing configurations
         cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
         for cid, lookup in cur.fetchall():
-            if cid == self.current_class_id: continue # We'll substitute unsaved UI values
+            if cid == self.current_class_id: continue 
             tgt_name = lookup.split('.')[0].strip().lower()
             for t_id, t_name in classes.items():
-                if t_name.lower() == tgt_name:
-                    graph[cid].add(t_id)
+                if t_name.lower() == tgt_name: graph[cid].add(t_id)
 
-        # Inject currently unsaved UI parameters
         for i in range(self.attributes_layout.count()):
             widget = self.attributes_layout.itemAt(i).widget()
             if isinstance(widget, AttributeRow) and widget.type_combo.currentText() == "look-through":
@@ -449,10 +469,8 @@ class ClassBuilderDialog(QDialog):
                 if lookup:
                     tgt_name = lookup.split('.')[0].strip().lower()
                     for t_id, t_name in classes.items():
-                        if t_name.lower() == tgt_name:
-                            graph[temp_id].add(t_id)
+                        if t_name.lower() == tgt_name: graph[temp_id].add(t_id)
 
-        # Graph DFS cycle detection
         visited = set()
         temp_mark = set()
         def visit(n):
@@ -476,35 +494,74 @@ class ClassBuilderDialog(QDialog):
             QMessageBox.warning(self, "Error", "Class name cannot be empty.")
             return
 
+        safe_class_name = sanitize_name(name)
+        cur = self.db.cursor()
+
+        try:
+            cur.execute("SELECT id, name FROM classes")
+            for r_id, r_name in cur.fetchall():
+                if r_id != self.current_class_id and sanitize_name(r_name) == safe_class_name:
+                    QMessageBox.warning(self, "Error", f"Class name '{name}' collides with existing class '{r_name}'.")
+                    return
+        except sqlite3.OperationalError:
+            pass 
+
         attr_names = set()
         for i in range(self.attributes_layout.count()):
             widget = self.attributes_layout.itemAt(i).widget()
             if isinstance(widget, AttributeRow):
                 attr_name = widget.name_input.text().strip()
                 if not attr_name: continue
-                safe_name = attr_name.replace(' ', '_').lower()
+                safe_name = sanitize_name(attr_name)
+                
+                restricted_keywords = {"id", "rowid", "oid", "_rowid_"}
+                if safe_name in restricted_keywords:
+                    QMessageBox.warning(self, "Error", f"'{attr_name}' is a reserved database keyword.")
+                    return
+                    
                 if safe_name in attr_names:
-                    QMessageBox.warning(self, "Error", f"Duplicate attribute detected: '{attr_name}'. Attribute names must be unique.")
+                    QMessageBox.warning(self, "Error", f"Duplicate or colliding attribute detected: '{attr_name}'.")
                     return
                 attr_names.add(safe_name)
 
         if self.check_for_circular_dependencies(name):
             QMessageBox.critical(self, "Circular Dependency Detected", 
-                "Cannot save class: This 'Look-Through' configuration creates an infinite circular loop.\n\n"
-                "For example: Class A looks through Class B, and Class B looks through Class A. "
-                "Please fix the routing architecture.")
+                "Cannot save class: This 'Look-Through' configuration creates an infinite circular loop.")
             return
 
-        cur = self.db.cursor()
         try:
             if self.current_class_id is None:
                 cur.execute("INSERT INTO classes (name, path) VALUES (?, ?)", (name, path_val))
                 self.current_class_id = cur.lastrowid
+                table_name = f"objects_{safe_class_name}"
             else:
+                cur.execute("SELECT name FROM classes WHERE id = ?", (self.current_class_id,))
+                old_class_name = cur.fetchone()[0]
                 cur.execute("UPDATE classes SET name = ?, path = ? WHERE id = ?", (name, path_val, self.current_class_id))
-            
-            cur.execute("DELETE FROM attributes WHERE class_id = ?", (self.current_class_id,))
-            cur.execute("DELETE FROM relationships WHERE source_class = ?", (self.current_class_id,))
+                
+                # --- CASCADING CLASS RENAME FOR LOOK-THROUGHS ---
+                if old_class_name != name:
+                    cur.execute("SELECT id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query LIKE ?", (f"{old_class_name}.%",))
+                    for a_id, l_query in cur.fetchall():
+                        parts = l_query.split('.')
+                        if len(parts) == 2 and parts[0] == old_class_name:
+                            new_query = f"{name}.{parts[1]}"
+                            cur.execute("UPDATE attributes SET lookup_query = ? WHERE id = ?", (new_query, a_id))
+                
+                old_safe_class = sanitize_name(old_class_name)
+                table_name = f"objects_{safe_class_name}"
+                
+                if old_safe_class != safe_class_name:
+                    try:
+                        cur.execute(f"ALTER TABLE objects_{old_safe_class} RENAME TO {table_name}")
+                    except sqlite3.OperationalError as e:
+                        if "no such table" not in str(e).lower():
+                            QMessageBox.warning(self, "Database Warning", f"Could not rename physical table: {e}")
+
+            # Process Attributes Differentially to prevent Data Loss
+            cur.execute("SELECT id, name FROM attributes WHERE class_id = ?", (self.current_class_id,))
+            old_attrs = {row[0]: row[1] for row in cur.fetchall()}
+            processed_attrs = []
 
             for i in range(self.attributes_layout.count()):
                 widget = self.attributes_layout.itemAt(i).widget()
@@ -519,16 +576,54 @@ class ClassBuilderDialog(QDialog):
                     is_required = 1 if widget.req_cb.isChecked() else 0
                     lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
                     
-                    cur.execute("""
-                        INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required, lookup_query) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query))
-                    new_attr_id = cur.lastrowid
-
+                    if widget.attr_id and widget.attr_id in old_attrs:
+                        old_attr_name = old_attrs[widget.attr_id]
+                        old_safe_attr = sanitize_name(old_attr_name)
+                        new_safe_attr = sanitize_name(attr_name)
+                        
+                        # Handle Physical Column Renames
+                        if old_safe_attr != new_safe_attr:
+                            try:
+                                cur.execute(f"ALTER TABLE {table_name} RENAME COLUMN [{old_safe_attr}] TO [{new_safe_attr}]")
+                            except sqlite3.OperationalError as e:
+                                if "no such column" not in str(e).lower() and "no such table" not in str(e).lower():
+                                    QMessageBox.warning(self, "Database Warning", f"Could not rename physical column '{old_attr_name}': {e}")
+                                    
+                        # --- CASCADING ATTRIBUTE RENAME FOR LOOK-THROUGHS ---
+                        if old_attr_name != attr_name:
+                            old_lookup = f"{name}.{old_attr_name}" 
+                            new_lookup = f"{name}.{attr_name}"
+                            cur.execute("UPDATE attributes SET lookup_query = ? WHERE data_type = 'look-through' AND lookup_query = ?", (new_lookup, old_lookup))
+                            
+                        cur.execute("""
+                            UPDATE attributes 
+                            SET name=?, data_type=?, row_order=?, show_in_table=?, is_title=?, is_unique=?, is_required=?, lookup_query=? 
+                            WHERE id=?
+                        """, (attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query, widget.attr_id))
+                        attr_id = widget.attr_id
+                    else:
+                        cur.execute("""
+                            INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required, lookup_query) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query))
+                        attr_id = cur.lastrowid
+                        widget.attr_id = attr_id
+                    
+                    processed_attrs.append(attr_id)
+                    cur.execute("DELETE FROM matrix_columns WHERE attribute_id = ?", (attr_id,))
+                    
                     if attr_type == "matrix":
                         for idx, col_name in enumerate(widget.matrix_cols):
                             cur.execute("INSERT INTO matrix_columns (attribute_id, column_name, column_index) VALUES (?, ?, ?)",
-                                        (new_attr_id, col_name, idx))
+                                        (attr_id, col_name, idx))
+
+            for d_id in set(old_attrs.keys()) - set(processed_attrs):
+                cur.execute("DELETE FROM attributes WHERE id = ?", (d_id,))
+
+            # Process Relationships Differentially
+            cur.execute("SELECT id FROM relationships WHERE source_class = ?", (self.current_class_id,))
+            old_rels = {row[0] for row in cur.fetchall()}
+            processed_rels = []
 
             for i in range(self.relationships_layout.count()):
                 widget = self.relationships_layout.itemAt(i).widget()
@@ -538,8 +633,23 @@ class ClassBuilderDialog(QDialog):
                     show_in_table = 1 if widget.show_cb.isChecked() else 0
                     
                     if target_id is not None:
-                        cur.execute("INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_table) VALUES (?, ?, ?, ?, ?)",
-                                    (self.current_class_id, target_id, rel_type, i, show_in_table))
+                        if widget.rel_id and widget.rel_id in old_rels:
+                            cur.execute("""
+                                UPDATE relationships 
+                                SET target_class=?, rel_type=?, row_order=?, show_in_table=? 
+                                WHERE id=?
+                            """, (target_id, rel_type, i, show_in_table, widget.rel_id))
+                            processed_rels.append(widget.rel_id)
+                        else:
+                            cur.execute("""
+                                INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_table) 
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (self.current_class_id, target_id, rel_type, i, show_in_table))
+                            widget.rel_id = cur.lastrowid
+                            processed_rels.append(widget.rel_id)
+
+            for d_id in old_rels - set(processed_rels):
+                cur.execute("DELETE FROM relationships WHERE id = ?", (d_id,))
 
             self.db.commit()
             self.refresh_class_list()
@@ -548,6 +658,9 @@ class ClassBuilderDialog(QDialog):
         except sqlite3.IntegrityError:
             self.db.rollback()
             QMessageBox.warning(self, "Error", "Class name already exists.")
+        except Exception as e:
+            self.db.rollback()
+            QMessageBox.critical(self, "Database Error", str(e))
 
     def delete_class(self):
         if self.current_class_id is None: return

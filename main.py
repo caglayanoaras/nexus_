@@ -5,6 +5,7 @@ import csv
 import ast
 import datetime
 import traceback
+import qtawesome as qta
 from contextlib import redirect_stdout, redirect_stderr
 
 try:
@@ -24,25 +25,17 @@ from PySide6.QtCore import Qt, QSettings, QDateTime
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
 from PySide6.QtGui import QAction, QFontDatabase, QFont
 
-from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon
+from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon, sanitize_name
 
 # ==========================================
 # PHYSICAL SCHEMA SYNCHRONIZATION
 # ==========================================
 def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
-    """
-    Reads the metadata schema and updates the actual SQLite tables.
-    Generates a 3-Tier View Architecture:
-    1. base_view: Physical columns + Look-throughs (Allows infinite deep cascading without loops).
-    2. view: The UI table view (base_view + Relationships, respecting 'show_in_table').
-    3. full_view: The Omni-view for modules/export (base_view + Relationships, showing everything).
-    """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    safe_table_name = f"objects_{class_name.replace(' ', '_').lower()}"
+    safe_table_name = f"objects_{sanitize_name(class_name)}"
     
-    # 1. FETCH METADATA
     cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
     attributes = cur.fetchall()
     
@@ -50,7 +43,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     attr_app_types = {}
     
     for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
-        safe_col_name = attr_name.replace(' ', '_').lower()
+        safe_col_name = sanitize_name(attr_name)
         if attr_type == "look-through":
             attr_app_types[safe_col_name] = attr_type
             continue
@@ -62,7 +55,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         required_cols.append((safe_col_name, sql_type))
         attr_app_types[safe_col_name] = attr_type
 
-    # 2. CREATE OR UPDATE PRIMARY TABLE
     cur.execute(f"SELECT count(name) FROM sqlite_master WHERE type='table' AND name='{safe_table_name}'")
     if cur.fetchone()[0] == 0:
         cols_def = ", ".join([f"[{c}] {t}" for c, t in required_cols])
@@ -71,7 +63,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         else:
             cur.execute(f"CREATE TABLE {safe_table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
     else:
-        # Check for type changes and missing columns
         cur.execute(f"PRAGMA table_info({safe_table_name})")
         existing_cols = {row[1]: row[2] for row in cur.fetchall()}
         
@@ -176,12 +167,11 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 if col_name not in existing_cols:
                     cur.execute(f"ALTER TABLE {safe_table_name} ADD COLUMN [{col_name}] {col_type}")
 
-    # 3. ENSURE JUNCTION TABLES EXIST 
     cur.execute("SELECT c.name, r.rel_type, c.id, r.show_in_table FROM relationships r JOIN classes c ON r.target_class = c.id WHERE r.source_class = ? ORDER BY r.row_order", (class_id,))
     outgoing_rels = cur.fetchall()
     
     for target_name, rel_type, target_class_id, show_in_table in outgoing_rels:
-        safe_target_name = target_name.replace(' ', '_').lower()
+        safe_target_name = sanitize_name(target_name)
         cur.execute(f"CREATE TABLE IF NOT EXISTS objects_{safe_target_name} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
         junc_table = f"rel_{safe_table_name}_to_objects_{safe_target_name}"
         cur.execute(f"CREATE TABLE IF NOT EXISTS {junc_table} (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, target_id INTEGER, FOREIGN KEY(source_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES objects_{safe_target_name}(id) ON DELETE CASCADE)")
@@ -190,24 +180,22 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     incoming_rels = cur.fetchall()
 
     for source_name, rel_type, source_class_id, show_in_table in incoming_rels:
-        safe_source_name = source_name.replace(' ', '_').lower()
+        safe_source_name = sanitize_name(source_name)
         cur.execute(f"CREATE TABLE IF NOT EXISTS objects_{safe_source_name} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
         junc_table = f"rel_objects_{safe_source_name}_to_{safe_table_name}"
         cur.execute(f"CREATE TABLE IF NOT EXISTS {junc_table} (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, target_id INTEGER, FOREIGN KEY(source_id) REFERENCES objects_{safe_source_name}(id) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES {safe_table_name}(id) ON DELETE CASCADE)")
 
-    # 4. TIER 1: BASE VIEW (Physical Columns + Deep Cascading Look-Throughs)
     base_selects = ["m.id AS [ID]"]
     for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
-        safe_col_name = attr_name.replace(' ', '_').lower()
+        safe_col_name = sanitize_name(attr_name)
         if attr_type == "look-through":
             if lookup_query:
                 parts = lookup_query.split('.')
                 if len(parts) == 2:
                     tgt_class, tgt_attr = parts
-                    safe_tgt_class = tgt_class.strip().replace(' ', '_').lower()
+                    safe_tgt_class = sanitize_name(tgt_class.strip())
                     junc_table = f"rel_{safe_table_name}_to_objects_{safe_tgt_class}"
-                    # Base View queries Base View of the target - allowing infinite depth!
-                    subquery = f"(SELECT GROUP_CONCAT(tgt_v.[{tgt_attr.strip()}]) FROM {junc_table} j JOIN base_view_{safe_tgt_class} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = m.id)"
+                    subquery = f"(SELECT GROUP_CONCAT(tgt_v.[{tgt_attr.strip()}]) FROM {junc_table} j JOIN base_view_objects_{safe_tgt_class} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = m.id)"
                     base_selects.append(f"{subquery} AS [{attr_name}]")
                 else:
                     raise ValueError(f"Invalid lookup format '{lookup_query}'. Expected 'TargetClass.Attribute'.")
@@ -220,7 +208,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     cur.execute(f"DROP VIEW IF EXISTS {base_view_name}")
     cur.execute(f"CREATE VIEW {base_view_name} AS SELECT {', '.join(base_selects)} FROM {safe_table_name} m")
 
-    # 5. TIER 2 & 3: UI VIEW AND FULL (OMNI) VIEW (Resolves Relationships)
     ui_selects = ["v.[ID]"]
     full_selects = ["v.[ID]"]
 
@@ -230,7 +217,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         full_selects.append(col_sql)
 
     for target_name, rel_type, target_class_id, show_in_table in outgoing_rels:
-        safe_target_name = target_name.replace(' ', '_').lower()
+        safe_target_name = sanitize_name(target_name)
         junc_table = f"rel_{safe_table_name}_to_objects_{safe_target_name}"
         
         cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
@@ -238,7 +225,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         if title_rows:
             for (t_name,) in title_rows:
                 display_label = f"[{target_name} ({t_name})]"
-                query_str = f"(SELECT GROUP_CONCAT(tgt_v.[{t_name}]) FROM {junc_table} j JOIN base_view_{safe_target_name} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = v.[ID]) AS {display_label}"
+                query_str = f"(SELECT GROUP_CONCAT(tgt_v.[{t_name}]) FROM {junc_table} j JOIN base_view_objects_{safe_target_name} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = v.[ID]) AS {display_label}"
                 if show_in_table: ui_selects.append(query_str)
                 full_selects.append(query_str)
         else:
@@ -248,7 +235,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             full_selects.append(query_str)
 
     for source_name, rel_type, source_class_id, show_in_table in incoming_rels:
-        safe_source_name = source_name.replace(' ', '_').lower()
+        safe_source_name = sanitize_name(source_name)
         junc_table = f"rel_objects_{safe_source_name}_to_{safe_table_name}"
         
         cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (source_class_id,))
@@ -256,7 +243,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         if title_rows:
             for (t_name,) in title_rows:
                 display_label = f"[From {source_name} ({t_name})]"
-                query_str = f"(SELECT GROUP_CONCAT(src_v.[{t_name}]) FROM {junc_table} j JOIN base_view_{safe_source_name} src_v ON j.source_id = src_v.[ID] WHERE j.target_id = v.[ID]) AS {display_label}"
+                query_str = f"(SELECT GROUP_CONCAT(src_v.[{t_name}]) FROM {junc_table} j JOIN base_view_objects_{safe_source_name} src_v ON j.source_id = src_v.[ID] WHERE j.target_id = v.[ID]) AS {display_label}"
                 if show_in_table: ui_selects.append(query_str)
                 full_selects.append(query_str)
         else:
@@ -279,9 +266,6 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     return view_name, safe_table_name
 
 
-# ==========================================
-# OBJECT EDITOR DIALOG (ADD & EDIT)
-# ==========================================
 class ObjectEditorDialog(QDialog):
     def __init__(self, db_path, class_id, class_name, table_name, obj_id=None, parent=None):
         super().__init__(parent)
@@ -314,15 +298,13 @@ class ObjectEditorDialog(QDialog):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         
-        # --- Add Attributes to Form ---
         cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (self.class_id,))
         attributes = cur.fetchall()
 
         for attr_id, attr_name, attr_type, is_unique, is_required in attributes:
-            safe_col_name = attr_name.replace(' ', '_').lower()
+            safe_col_name = sanitize_name(attr_name)
             
-            if attr_type == "look-through":
-                continue
+            if attr_type == "look-through": continue
                 
             self.attr_app_types[safe_col_name] = attr_type
             self.attr_constraints[safe_col_name] = {
@@ -339,8 +321,7 @@ class ObjectEditorDialog(QDialog):
                 widget.setRange(-1e9, 1e9)
                 widget.setDecimals(4)
             elif attr_type == "boolean":
-                widget = QCheckBox()
-                widget.setText("Yes / True")
+                widget = QCheckBox("Yes / True")
             elif attr_type == "date":
                 widget = QDateTimeEdit()
                 widget.setCalendarPopup(True) 
@@ -349,8 +330,7 @@ class ObjectEditorDialog(QDialog):
                 widget = QTextEdit()
                 widget.setMaximumHeight(100) 
             elif attr_type in ("list", "matrix"):
-                widget = QLineEdit()
-                widget.setText("[]") 
+                widget = QLineEdit("[]") 
                 if attr_type == "matrix":
                     cur.execute("SELECT count(*) FROM matrix_columns WHERE attribute_id = ?", (attr_id,))
                     col_count = cur.fetchone()[0]
@@ -362,12 +342,9 @@ class ObjectEditorDialog(QDialog):
                 widget = QLineEdit() 
                 
             self.input_widgets[safe_col_name] = widget
-            
             label_text = attr_name + (" <span style='color:red;'>*</span>" if is_required else "") + ":"
-            label = QLabel(label_text)
-            form_layout.addRow(label, widget)
+            form_layout.addRow(QLabel(label_text), widget)
 
-        # --- Add Relationships to Form ---
         cur.execute("""
             SELECT c.id, c.name, r.rel_type 
             FROM relationships r JOIN classes c ON r.target_class = c.id 
@@ -376,7 +353,7 @@ class ObjectEditorDialog(QDialog):
         relationships = cur.fetchall()
 
         for target_class_id, target_name, rel_type in relationships:
-            safe_target_name = target_name.replace(' ', '_').lower()
+            safe_target_name = sanitize_name(target_name)
             junc_table = f"rel_{self.table_name}_to_objects_{safe_target_name}"
             
             rel_container = QVBoxLayout()
@@ -392,7 +369,6 @@ class ObjectEditorDialog(QDialog):
                 list_widget.setSelectionMode(QListWidget.SingleSelection)
             else:
                 list_widget.setSelectionMode(QListWidget.MultiSelection)
-                
             list_widget.setMinimumHeight(120) 
             
             cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (target_class_id,))
@@ -402,29 +378,20 @@ class ObjectEditorDialog(QDialog):
                 if title_rows:
                     title_cols = [r[0] for r in title_rows] 
                     escaped_cols = ", ".join([f"[{c}]" for c in title_cols])
-                    # Query directly from base_view to guarantee resolving physical AND look-through titles perfectly
-                    cur.execute(f"SELECT [ID], {escaped_cols} FROM base_view_{safe_target_name}")
+                    cur.execute(f"SELECT [ID], {escaped_cols} FROM base_view_objects_{safe_target_name}")
                     
                     for row in cur.fetchall():
                         t_id = row[0]
-                        display_vals = []
-                        
-                        for val in row[1:]:
-                            if val is None or str(val).strip() == "":
-                                display_vals.append("None")
-                            else:
-                                display_vals.append(str(val))
-                                
+                        display_vals = ["None" if val is None or str(val).strip() == "" else str(val) for val in row[1:]]
                         combined_titles = " --- ".join(display_vals)
                         display_text = f"{combined_titles} (ID: {t_id})"
-                        search_text_data = combined_titles.lower()
                             
                         item = QListWidgetItem(display_text)
                         item.setData(Qt.UserRole, t_id)
-                        item.setData(Qt.UserRole + 1, search_text_data)
+                        item.setData(Qt.UserRole + 1, combined_titles.lower())
                         list_widget.addItem(item)
                 else:
-                    cur.execute(f"SELECT [ID] FROM base_view_{safe_target_name}")
+                    cur.execute(f"SELECT [ID] FROM base_view_objects_{safe_target_name}")
                     for row in cur.fetchall():
                         t_id = row[0]
                         item = QListWidgetItem(f"{target_name} #{t_id}")
@@ -437,14 +404,9 @@ class ObjectEditorDialog(QDialog):
             rel_container.addWidget(list_widget)
             search_box.textChanged.connect(lambda text, lw=list_widget: self.filter_list_items(text, lw))
                 
-            self.rel_widgets[junc_table] = {
-                "widget": list_widget,
-                "rel_type": rel_type,
-                "target_name": target_name
-            }
+            self.rel_widgets[junc_table] = {"widget": list_widget, "rel_type": rel_type, "target_name": target_name}
             form_layout.addRow(f"Rel: {target_name}:", rel_container)
 
-        # --- PRE-FILL DATA ---
         if self.obj_id:
             cols = list(self.input_widgets.keys())
             if cols:
@@ -475,17 +437,19 @@ class ObjectEditorDialog(QDialog):
                 lw = data["widget"]
                 for i in range(lw.count()):
                     item = lw.item(i)
-                    if item.data(Qt.UserRole) in existing_targets:
-                        item.setSelected(True)
+                    if item.data(Qt.UserRole) in existing_targets: item.setSelected(True)
 
         conn.close()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
 
         btn_layout = QHBoxLayout()
-        btn_save = QPushButton("Save Object")
+        btn_save = QPushButton(" Save Object")
+        btn_save.setIcon(qta.icon('fa5s.save'))
         btn_save.clicked.connect(self.save_record)
-        btn_cancel = QPushButton("Cancel")
+        
+        btn_cancel = QPushButton(" Cancel")
+        btn_cancel.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
         btn_cancel.clicked.connect(self.reject)
         
         btn_layout.addStretch() 
@@ -498,13 +462,11 @@ class ObjectEditorDialog(QDialog):
         for i in range(list_widget.count()):
             item = list_widget.item(i)
             search_target = item.data(Qt.UserRole + 1)
-            if search_target is None:
-                search_target = item.text().lower() 
+            if search_target is None: search_target = item.text().lower() 
             item.setHidden(search_text not in search_target)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
-            return 
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter: return 
         super().keyPressEvent(event)
 
     def save_record(self):
@@ -538,32 +500,27 @@ class ObjectEditorDialog(QDialog):
                 else: 
                     raw_text = widget.text().strip()
                     is_empty = (raw_text == "")
-                    
                     if is_empty:
                         val = None
                     else:
                         if app_type in ("list", "matrix"):
                             try:
                                 parsed = ast.literal_eval(raw_text)
-                                if not isinstance(parsed, list):
-                                    raise ValueError("Not a list.")
+                                if not isinstance(parsed, list): raise ValueError("Not a list.")
                                     
                                 if app_type == "matrix":
                                     expected_cols = self.matrix_col_counts.get(col_name, 0)
                                     if len(parsed) != expected_cols:
                                         raise ValueError(f"Matrix expects exactly {expected_cols} column list(s) inside the main list.")
                                     for inner in parsed:
-                                        if not isinstance(inner, list):
-                                            raise ValueError("Each matrix column must be a list.")
-                                
+                                        if not isinstance(inner, list): raise ValueError("Each matrix column must be a list.")
                                 val = str(parsed)
                             except Exception as e:
                                 err_msg = str(e) if str(e) else "Invalid Python syntax."
                                 QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' parsing failed: {err_msg}\n\nExample: [['A', 'B'], [1, 2]]")
                                 conn.close()
                                 return 
-                        else:
-                            val = raw_text
+                        else: val = raw_text
 
                 if constraints['required'] and is_empty:
                     QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' is a required field.")
@@ -599,8 +556,7 @@ class ObjectEditorDialog(QDialog):
                     active_obj_id = cur.lastrowid
             else:
                 if not self.obj_id:
-                    query = f"INSERT INTO {self.table_name} DEFAULT VALUES"
-                    cur.execute(query)
+                    cur.execute(f"INSERT INTO {self.table_name} DEFAULT VALUES")
                     active_obj_id = cur.lastrowid
                 
             for junc_table, data in self.rel_widgets.items():
@@ -639,7 +595,8 @@ class SettingsDialog(QDialog):
         self.path_input = QLineEdit()
         self.path_input.setText(self.settings.value("db_path", ""))
         
-        btn_browse = QPushButton("Browse...")
+        btn_browse = QPushButton(" Browse...")
+        btn_browse.setIcon(qta.icon('fa5s.folder-open'))
         btn_browse.clicked.connect(self.browse_file)
         
         path_layout.addWidget(self.path_input)
@@ -648,7 +605,8 @@ class SettingsDialog(QDialog):
         
         btn_db_layout = QHBoxLayout()
         btn_db_layout.addStretch()
-        btn_db_save = QPushButton("Save")
+        btn_db_save = QPushButton(" Save")
+        btn_db_save.setIcon(qta.icon('fa5s.save'))
         btn_db_save.clicked.connect(self.save_db_settings)
         btn_db_layout.addWidget(btn_db_save)
         
@@ -671,7 +629,8 @@ class SettingsDialog(QDialog):
             
         self.output_input.setText(self.settings.value("module_output_path", default_out))
         
-        btn_browse_out = QPushButton("Browse...")
+        btn_browse_out = QPushButton(" Browse...")
+        btn_browse_out.setIcon(qta.icon('fa5s.folder-open'))
         btn_browse_out.clicked.connect(self.browse_output_file)
         
         out_layout.addWidget(self.output_input)
@@ -680,7 +639,8 @@ class SettingsDialog(QDialog):
         
         btn_mod_layout = QHBoxLayout()
         btn_mod_layout.addStretch()
-        btn_mod_save = QPushButton("Save")
+        btn_mod_save = QPushButton(" Save")
+        btn_mod_save.setIcon(qta.icon('fa5s.save'))
         btn_mod_save.clicked.connect(self.save_module_path)
         btn_mod_layout.addWidget(btn_mod_save)
         
@@ -690,19 +650,16 @@ class SettingsDialog(QDialog):
 
     def browse_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Select SQLite Database", "", "SQLite DB (*.db *.sqlite)")
-        if file_name:
-            self.path_input.setText(file_name)
+        if file_name: self.path_input.setText(file_name)
 
     def browse_output_file(self):
         file_name, _ = QFileDialog.getSaveFileName(self, "Select Output File", "", "Text Files (*.txt)")
-        if file_name:
-            self.output_input.setText(file_name)
+        if file_name: self.output_input.setText(file_name)
 
     def save_db_settings(self):
         path = self.path_input.text().strip()
         if not path: return
-        if not os.path.exists(path):
-            init_db(path)
+        if not os.path.exists(path): init_db(path)
         self.settings.setValue("db_path", path)
         QMessageBox.information(self, "Success", "Database path saved as default.")
         
@@ -733,8 +690,10 @@ class ModuleBuilderDialog(QDialog):
         self.module_list_widget.setHeaderHidden(True)
         self.module_list_widget.itemClicked.connect(self.load_module)
         
-        btn_add = QPushButton("+ Create New Module")
+        btn_add = QPushButton(" Create New Module")
+        btn_add.setIcon(qta.icon('fa5s.plus-circle'))
         btn_add.clicked.connect(self.create_new_module)
+        
         left_layout.addWidget(QLabel("<b>Saved Modules</b>"))
         left_layout.addWidget(self.module_list_widget)
         left_layout.addWidget(btn_add)
@@ -766,14 +725,17 @@ class ModuleBuilderDialog(QDialog):
         
         btn_layout = QHBoxLayout()
         
-        btn_delete = QPushButton("Delete Module")
+        btn_delete = QPushButton(" Delete Module")
+        btn_delete.setIcon(qta.icon('fa5s.trash-alt', color='white'))
         btn_delete.setStyleSheet("background-color: #ff4c4c; color: white;")
         btn_delete.clicked.connect(self.delete_module)
         
-        btn_save = QPushButton("\U0001F4BE Save Module")
+        btn_save = QPushButton(" Save Module")
+        btn_save.setIcon(qta.icon('fa5s.save'))
         btn_save.clicked.connect(self.save_module)
         
-        btn_run = QPushButton("\u25B6 Run Script")
+        btn_run = QPushButton(" Run Script")
+        btn_run.setIcon(qta.icon('fa5s.play', color='white'))
         btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 5px 15px;")
         btn_run.clicked.connect(self.run_script)
         
@@ -823,13 +785,15 @@ class ModuleBuilderDialog(QDialog):
                     current_path = f"{current_path}/{part}" if current_path else part
                     
                     if current_path not in root_items:
-                        folder_item = QTreeWidgetItem([f"\U0001F4C1 {part}"])
+                        folder_item = QTreeWidgetItem([part])
+                        folder_item.setIcon(0, qta.icon('fa5s.folder', color='#FFC107'))
                         current_parent.addChild(folder_item)
                         root_items[current_path] = folder_item
                     
                     current_parent = root_items[current_path]
             
-            item = QTreeWidgetItem([f"\U0001F4BB {mname}"])
+            item = QTreeWidgetItem([mname])
+            item.setIcon(0, qta.icon('fa5s.file-code', color='#2196F3'))
             item.setData(0, Qt.UserRole, mid)
             current_parent.addChild(item)
             
@@ -877,14 +841,6 @@ class ModuleBuilderDialog(QDialog):
             
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS modules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT DEFAULT '',
-                code TEXT DEFAULT ''
-            )
-        """)
         try:
             if self.current_module_id is None:
                 cur.execute("INSERT INTO modules (name, path, code) VALUES (?, ?, ?)", (name, path_val, code))
@@ -915,9 +871,7 @@ class ModuleBuilderDialog(QDialog):
             self.refresh_module_list()
 
     def get_objects(self, class_name):
-        if pd is None:
-            raise ImportError("Pandas library is not installed.")
-            
+        if pd is None: raise ImportError("Pandas library is not installed.")
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         cur.execute("SELECT id FROM classes WHERE name = ?", (class_name,))
@@ -929,8 +883,7 @@ class ModuleBuilderDialog(QDialog):
         conn.close()
         
         view_name, safe_table_name = sync_physical_table(self.db_path, cls_id, class_name, parent_widget=None)
-        if not view_name:
-            raise RuntimeError(f"Failed to sync schema for class '{class_name}'.")
+        if not view_name: raise RuntimeError(f"Failed to sync schema for class '{class_name}'.")
             
         full_view_name = f"full_view_{safe_table_name}"
         conn = sqlite3.connect(self.db_path)
@@ -942,17 +895,12 @@ class ModuleBuilderDialog(QDialog):
         code = self.editor.toPlainText()
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
-        
-        context = {
-            'get_objects': self.get_objects,
-            'pd': pd 
-        }
+        context = {'get_objects': self.get_objects, 'pd': pd}
         
         try:
             with open(out_path, 'w', encoding='utf-8') as f:
                 f.write(f"--- Script Executed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
-                with redirect_stdout(f), redirect_stderr(f):
-                    exec(code, context)
+                with redirect_stdout(f), redirect_stderr(f): exec(code, context)
             QMessageBox.information(self, "Success", f"Script executed successfully.\nOutput saved to:\n{out_path}")
         except Exception as e:
             with open(out_path, 'a', encoding='utf-8') as f:
@@ -971,8 +919,7 @@ class DataBrowserPage(QWidget):
         self.current_view_name = None
         self.current_table_name = None
         self.db_path = ""
-        
-        self.hidden_columns_memory = {} # New memory bank for hidden columns by name
+        self.hidden_columns_memory = {}
         
         self.page_size = 100
         self.current_page = 0
@@ -982,12 +929,12 @@ class DataBrowserPage(QWidget):
         self.current_sort_order = "ASC"
         
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 9, 9, 9)
 
-        self.header_label = QLabel("<h2></h2>")
+        self.header_label = QLabel("<h2>&nbsp;</h2>")
         layout.addWidget(self.header_label)
 
         search_layout = QHBoxLayout()
-        
         self.col_combo = QComboBox()
         self.col_combo.addItem("All Columns", -1)
         
@@ -995,18 +942,26 @@ class DataBrowserPage(QWidget):
         self.search_input.setPlaceholderText("Filter text...")
         self.search_input.returnPressed.connect(self.trigger_search)
         
-        self.btn_search = QPushButton("\U0001F50D Search") 
+        self.btn_search = QPushButton(" Search") 
+        self.btn_search.setIcon(qta.icon('fa5s.search'))
         self.btn_search.clicked.connect(self.trigger_search)
         
-        self.btn_import = QPushButton("\U0001F4E4 Import")
+        self.btn_import = QPushButton(" Import")
+        self.btn_import.setIcon(qta.icon('fa5s.file-import'))
         self.btn_import.clicked.connect(self.import_data)
         
-        self.btn_export = QPushButton("\U0001F4BE Export")
+        self.btn_export = QPushButton(" Export")
+        self.btn_export.setIcon(qta.icon('fa5s.file-export'))
         self.btn_export.clicked.connect(self.export_data)
         
-        self.btn_add = QPushButton("+ Add Object")
-        self.btn_edit = QPushButton("Edit")
-        self.btn_delete = QPushButton("Delete")
+        self.btn_add = QPushButton(" Add Object")
+        self.btn_add.setIcon(qta.icon('fa5s.plus'))
+        
+        self.btn_edit = QPushButton(" Edit")
+        self.btn_edit.setIcon(qta.icon('fa5s.edit'))
+        
+        self.btn_delete = QPushButton(" Delete")
+        self.btn_delete.setIcon(qta.icon('fa5s.trash-alt'))
         
         self.btn_import.setEnabled(False)
         self.btn_add.setEnabled(False) 
@@ -1034,17 +989,15 @@ class DataBrowserPage(QWidget):
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setEditTriggers(QTableView.NoEditTriggers)
         self.table_view.doubleClicked.connect(self.open_edit_dialog)
-        
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self.show_context_menu)
-        
         self.table_view.setSortingEnabled(True)
+        
         header = self.table_view.horizontalHeader()
         header.setSectionsMovable(True)
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
         header.sortIndicatorChanged.connect(self.on_sort_changed)
-        
         header.setContextMenuPolicy(Qt.CustomContextMenu)
         header.customContextMenuRequested.connect(self.show_header_context_menu)
         
@@ -1056,13 +1009,16 @@ class DataBrowserPage(QWidget):
 
         page_layout = QHBoxLayout()
         
-        self.btn_prev = QPushButton("\u25C0 Prev") 
+        self.btn_prev = QPushButton(" Prev") 
+        self.btn_prev.setIcon(qta.icon('fa5s.chevron-left'))
         self.btn_prev.clicked.connect(self.prev_page)
         
         self.page_label = QLabel("Page 0 of 0 (Total: 0)")
         self.page_label.setAlignment(Qt.AlignCenter)
         
-        self.btn_next = QPushButton("Next \u25B6") 
+        self.btn_next = QPushButton("Next ") 
+        self.btn_next.setIcon(qta.icon('fa5s.chevron-right'))
+        self.btn_next.setLayoutDirection(Qt.RightToLeft)
         self.btn_next.clicked.connect(self.next_page)
         
         self.page_size_combo = QComboBox()
@@ -1090,17 +1046,25 @@ class DataBrowserPage(QWidget):
         
         self.db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
         
-        # ERROR AGGREGATION at the Table Generation level
         try:
             self.current_view_name, self.current_table_name = sync_physical_table(self.db_path, class_id, class_name, parent_widget=self)
-        except Exception as e:
-            QMessageBox.critical(self, "Schema Load Error", f"Failed to generate table data for '{class_name}'.\n\nEnsure there are no broken links in the class configuration.\n\nDetails:\n{str(e)}")
-            self.header_label.setText("<h2>Sync Aborted</h2>")
-            self.btn_import.setEnabled(False)
-            self.btn_add.setEnabled(False)
-            return
             
-        if not self.current_view_name:
+            if not self.current_view_name:
+                raise RuntimeError("Sync aborted or failed to generate a valid view.")
+                
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            
+            # Surface SQLite Operational Crash to UI exactly here
+            cur.execute(f"PRAGMA table_info({self.current_view_name})")
+            columns = [row[1] for row in cur.fetchall()]
+            conn.close()
+            
+            if not columns:
+                raise sqlite3.OperationalError(f"View '{self.current_view_name}' is broken and returned no columns.")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Schema Load Error", f"A database operational error occurred while loading '{class_name}'.\n\nThis is usually caused by broken 'Look-through' attributes referencing deleted or missing columns.\n\nDetails:\n{str(e)}")
             self.header_label.setText("<h2>Sync Aborted</h2>")
             self.btn_import.setEnabled(False)
             self.btn_add.setEnabled(False)
@@ -1116,12 +1080,6 @@ class DataBrowserPage(QWidget):
         header.setSortIndicator(0, Qt.AscendingOrder)
         header.blockSignals(False)
 
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({self.current_view_name})")
-        columns = [row[1] for row in cur.fetchall()]
-        conn.close()
-        
         self.col_combo.blockSignals(True)
         self.col_combo.clear()
         self.col_combo.addItem("All Columns", -1)
@@ -1156,8 +1114,7 @@ class DataBrowserPage(QWidget):
                 params.append(f"%{search_text}%")
         
         where_sql = ""
-        if where_clauses:
-            where_sql = " WHERE " + " AND ".join(where_clauses)
+        if where_clauses: where_sql = " WHERE " + " AND ".join(where_clauses)
             
         count_query = f"SELECT COUNT(*) {base_query} {where_sql}"
         cur.execute(count_query, params)
@@ -1175,11 +1132,13 @@ class DataBrowserPage(QWidget):
         query = QSqlQuery(db)
         query.prepare(final_query)
         for p in params: query.addBindValue(p)
-        query.exec()
         
+        query.exec()
+        if query.lastError().isValid():
+            QMessageBox.critical(self, "Database Query Error", f"An error occurred while fetching data from the view:\n\n{query.lastError().text()}")
+            
         self.query_model.setQuery(query)
         
-        # Apply hidden columns memory by checking actual column names
         hidden_for_class = self.hidden_columns_memory.get(self.current_class_name, set())
         for i in range(self.query_model.columnCount()):
             col_name = self.query_model.headerData(i, Qt.Horizontal)
@@ -1196,8 +1155,7 @@ class DataBrowserPage(QWidget):
 
     def on_sort_changed(self, logical_index, order):
         col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
-        if not col_name: 
-            return 
+        if not col_name: return 
         self.current_sort_col = col_name
         self.current_sort_order = "ASC" if order == Qt.AscendingOrder else "DESC"
         self.build_and_exec_query()
@@ -1236,7 +1194,6 @@ class DataBrowserPage(QWidget):
     def show_header_context_menu(self, position):
         header = self.table_view.horizontalHeader()
         logical_index = header.logicalIndexAt(position)
-        
         menu = QMenu()
         
         act_hide = None
@@ -1244,57 +1201,47 @@ class DataBrowserPage(QWidget):
             col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
             if col_name:
                 visible_count = sum(1 for i in range(header.count()) if not self.table_view.isColumnHidden(i))
-                if visible_count > 1:
-                    act_hide = menu.addAction(f"Hide '{col_name}' Temporarily")
+                if visible_count > 1: act_hide = menu.addAction(f"Hide '{col_name}' Temporarily")
         
         hidden_cols = [i for i in range(header.count()) if self.table_view.isColumnHidden(i)]
         act_unhide = None
         if hidden_cols:
-            if act_hide:
-                menu.addSeparator()
+            if act_hide: menu.addSeparator()
             act_unhide = menu.addAction("Unhide All Columns")
             
-        if not menu.actions():
-            return
+        if not menu.actions(): return
             
         action = menu.exec(header.viewport().mapToGlobal(position))
         
         if act_hide and action == act_hide:
             self.table_view.setColumnHidden(logical_index, True)
             col_name = self.query_model.headerData(logical_index, Qt.Horizontal)
-            if col_name:
-                self.hidden_columns_memory.setdefault(self.current_class_name, set()).add(col_name)
+            if col_name: self.hidden_columns_memory.setdefault(self.current_class_name, set()).add(col_name)
         elif act_unhide and action == act_unhide:
-            for i in range(header.count()):
-                self.table_view.setColumnHidden(i, False)
+            for i in range(header.count()): self.table_view.setColumnHidden(i, False)
             if self.current_class_name in self.hidden_columns_memory:
                 self.hidden_columns_memory[self.current_class_name].clear()
 
     def show_context_menu(self, position):
-        if not self.table_view.selectionModel().selectedRows():
-            return
+        if not self.table_view.selectionModel().selectedRows(): return
         from PySide6.QtWidgets import QMenu
         menu = QMenu()
-        act_edit = menu.addAction("Edit Object")
-        act_del = menu.addAction("Delete Object")
+        act_edit = menu.addAction(qta.icon('fa5s.edit'), "Edit Object")
+        act_del = menu.addAction(qta.icon('fa5s.trash-alt'), "Delete Object")
         
         action = menu.exec(self.table_view.viewport().mapToGlobal(position))
-        if action == act_edit:
-            self.open_edit_dialog()
-        elif action == act_del:
-            self.delete_selected()
+        if action == act_edit: self.open_edit_dialog()
+        elif action == act_del: self.delete_selected()
 
     def open_add_dialog(self):
         dialog = ObjectEditorDialog(self.db_path, self.current_class_id, self.current_class_name, self.current_table_name, None, self)
-        if dialog.exec():
-            self.build_and_exec_query() 
+        if dialog.exec(): self.build_and_exec_query() 
             
     def open_edit_dialog(self):
         obj_id = self.get_selected_id()
         if not obj_id: return
         dialog = ObjectEditorDialog(self.db_path, self.current_class_id, self.current_class_name, self.current_table_name, obj_id, self)
-        if dialog.exec():
-            self.build_and_exec_query() 
+        if dialog.exec(): self.build_and_exec_query() 
             
     def delete_selected(self):
         obj_id = self.get_selected_id()
@@ -1318,10 +1265,8 @@ class DataBrowserPage(QWidget):
         file_path, selected_filter = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV Files (*.csv);;Excel Files (*.xlsx)")
         if not file_path: return
         
-        if "csv" in selected_filter.lower() and not file_path.lower().endswith(".csv"):
-            file_path += ".csv"
-        elif "excel" in selected_filter.lower() and not file_path.lower().endswith(".xlsx"):
-            file_path += ".xlsx"
+        if "csv" in selected_filter.lower() and not file_path.lower().endswith(".csv"): file_path += ".csv"
+        elif "excel" in selected_filter.lower() and not file_path.lower().endswith(".xlsx"): file_path += ".xlsx"
             
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -1350,8 +1295,7 @@ class DataBrowserPage(QWidget):
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.append(headers)
-                for row in data:
-                    ws.append(row)
+                for row in data: ws.append(row)
                 wb.save(file_path)
                 QMessageBox.information(self, "Success", "Exported to Excel successfully!")
             except ImportError:
@@ -1384,8 +1328,9 @@ class DataBrowserPage(QWidget):
             for attr_id, name, d_type, is_uniq, is_req in cur.fetchall():
                 if d_type == "look-through": continue
                 
-                attributes_meta[name.lower()] = {
-                    "safe_col": name.replace(' ', '_').lower(),
+                safe_name = sanitize_name(name)
+                attributes_meta[safe_name] = {
+                    "safe_col": safe_name,
                     "type": d_type,
                     "unique": bool(is_uniq),
                     "required": bool(is_req)
@@ -1398,7 +1343,7 @@ class DataBrowserPage(QWidget):
                 WHERE a.class_id = ? GROUP BY a.id
             """, (self.current_class_id,))
             for attr_name, col_count in cur.fetchall():
-                matrix_counts[attr_name.lower()] = col_count
+                matrix_counts[sanitize_name(attr_name)] = col_count
                 
             cur.execute("""
                 SELECT c.name, r.rel_type, c.id 
@@ -1407,14 +1352,14 @@ class DataBrowserPage(QWidget):
             """, (self.current_class_id,))
             relationships_meta = {}
             for t_name, r_type, t_class_id in cur.fetchall():
-                safe_target_name = t_name.replace(' ', '_').lower()
-                relationships_meta[t_name.lower()] = {
+                safe_target_name = sanitize_name(t_name)
+                relationships_meta[safe_target_name] = {
                     "target_table": f"objects_{safe_target_name}",
                     "junc_table": f"rel_{self.current_table_name}_to_objects_{safe_target_name}"
                 }
 
             existing_unique_values = {}
-            for name_lower, meta in attributes_meta.items():
+            for name_safe, meta in attributes_meta.items():
                 if meta["unique"]:
                     cur.execute(f"SELECT [{meta['safe_col']}] FROM {self.current_table_name} WHERE [{meta['safe_col']}] IS NOT NULL")
                     existing_unique_values[meta["safe_col"]] = set(row[0] for row in cur.fetchall())
@@ -1423,13 +1368,12 @@ class DataBrowserPage(QWidget):
             ws = wb.active
             
             all_rows = list(ws.iter_rows(values_only=True))
-            if len(all_rows) < 2:
-                raise ValueError("Excel file must contain at least a header row and one data row.")
+            if len(all_rows) < 2: raise ValueError("Excel file must contain at least a header row and one data row.")
                 
-            headers = [str(h).lower().strip() if h else "" for h in all_rows[0]]
+            headers = [sanitize_name(str(h)) if h else "" for h in all_rows[0]]
             
-            for name_lower, meta in attributes_meta.items():
-                if meta["required"] and name_lower not in headers:
+            for name_safe, meta in attributes_meta.items():
+                if meta["required"] and name_safe not in headers:
                     raise ValueError(f"CRITICAL: The required attribute '{meta['safe_col']}' is completely missing from the Excel headers!")
 
             in_file_unique_tracker = {meta["safe_col"]: set() for meta in attributes_meta.values() if meta["unique"]}
@@ -1437,8 +1381,7 @@ class DataBrowserPage(QWidget):
             validated_relationships = []
 
             for row_number, row_data in enumerate(all_rows[1:], start=2): 
-                if all(cell is None or str(cell).strip() == "" for cell in row_data):
-                    continue 
+                if all(cell is None or str(cell).strip() == "" for cell in row_data): continue 
 
                 insert_cols = []
                 insert_vals = []
@@ -1449,10 +1392,8 @@ class DataBrowserPage(QWidget):
                     header = headers[col_idx]
                     if not header: continue
                     
-                    if isinstance(cell_value, datetime.datetime):
-                        val = cell_value.strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        val = None if (cell_value is None or str(cell_value).strip() == "") else str(cell_value).strip()
+                    if isinstance(cell_value, datetime.datetime): val = cell_value.strftime("%Y-%m-%d %H:%M:%S")
+                    else: val = None if (cell_value is None or str(cell_value).strip() == "") else str(cell_value).strip()
                     
                     is_empty = (val is None)
 
@@ -1461,8 +1402,7 @@ class DataBrowserPage(QWidget):
                         safe_col = meta["safe_col"]
                         
                         if is_empty:
-                            if meta["required"]:
-                                raise ValueError(f"Row {row_number}: '{header}' is Required but cell is empty.")
+                            if meta["required"]: raise ValueError(f"Row {row_number}: '{header}' is Required but cell is empty.")
                             val_final = None
                         else:
                             if meta["type"] == "int":
@@ -1479,8 +1419,7 @@ class DataBrowserPage(QWidget):
                             elif meta["type"] in ("list", "matrix"):
                                 try:
                                     parsed = ast.literal_eval(val)
-                                    if not isinstance(parsed, list):
-                                        raise ValueError(f"Row {row_number}: '{header}' must be an enclosed list [].")
+                                    if not isinstance(parsed, list): raise ValueError(f"Row {row_number}: '{header}' must be an enclosed list [].")
                                     if meta["type"] == "matrix":
                                         expected_cols = matrix_counts.get(header, 0)
                                         if len(parsed) != expected_cols:
@@ -1504,10 +1443,8 @@ class DataBrowserPage(QWidget):
                     elif header in relationships_meta:
                         if not is_empty:
                             rel_meta = relationships_meta[header]
-                            try:
-                                target_ids = [int(x.strip()) for x in val.split(",")]
-                            except ValueError:
-                                raise ValueError(f"Row {row_number}: Relationship '{header}' must be comma-separated numeric IDs.")
+                            try: target_ids = [int(x.strip()) for x in val.split(",")]
+                            except ValueError: raise ValueError(f"Row {row_number}: Relationship '{header}' must be comma-separated numeric IDs.")
                                 
                             for tid in target_ids:
                                 cur.execute(f"SELECT id FROM {rel_meta['target_table']} WHERE id = ?", (tid,))
@@ -1533,8 +1470,7 @@ class DataBrowserPage(QWidget):
                 
                 rels_to_insert = validated_relationships[i]
                 for junc_table, target_ids in rels_to_insert.items():
-                    for tid in target_ids:
-                        cur.execute(f"INSERT INTO {junc_table} (source_id, target_id) VALUES (?, ?)", (new_obj_id, tid))
+                    for tid in target_ids: cur.execute(f"INSERT INTO {junc_table} (source_id, target_id) VALUES (?, ?)", (new_obj_id, tid))
             
             conn.commit()
             self.build_and_exec_query() 
@@ -1562,15 +1498,54 @@ class MainWindow(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         self.main_layout.addWidget(splitter)
 
+        # ---------------------------------------------
+        # LEFT PANEL: Splitting Classes and Modules
+        # ---------------------------------------------
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(9, 9, 9, 9)
+        
+        # Dummy header to perfectly align the top of the sidebars with the search layout
+        dummy_header = QLabel("<h2>&nbsp;</h2>")
+        left_layout.addWidget(dummy_header)
+        
+        left_splitter = QSplitter(Qt.Vertical)
+        
+        # 1. Classes Tree (Headers removed)
         self.sidebar = QTreeWidget()
         self.sidebar.setHeaderHidden(True)
         self.sidebar.itemClicked.connect(self.change_class)
-        splitter.addWidget(self.sidebar)
+        left_splitter.addWidget(self.sidebar)
 
+        # 2. Modules Tree (Headers removed)
+        self.module_sidebar = QTreeWidget()
+        self.module_sidebar.setHeaderHidden(True)
+        self.module_sidebar.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.module_sidebar.customContextMenuRequested.connect(self.show_module_context_menu)
+        left_splitter.addWidget(self.module_sidebar)
+
+        # Allocate 75% height to classes, 25% to modules
+        left_splitter.setSizes([750, 250])
+        left_layout.addWidget(left_splitter)
+        
+        # Dummy footer to perfectly align the bottom of the sidebars with the table view bottom
+        dummy_footer_layout = QHBoxLayout()
+        dummy_btn = QPushButton(" ")
+        dummy_btn.setFlat(True)
+        dummy_btn.setEnabled(False)
+        dummy_btn.setStyleSheet("background: transparent; color: transparent; border: none;")
+        dummy_footer_layout.addWidget(dummy_btn)
+        left_layout.addLayout(dummy_footer_layout)
+        
+        splitter.addWidget(left_widget)
+
+        # ---------------------------------------------
+        # RIGHT PANEL: Data Browser
+        # ---------------------------------------------
         self.data_browser = DataBrowserPage(self)
         splitter.addWidget(self.data_browser)
         
-        splitter.setSizes([200, 824])
+        splitter.setSizes([250, 950])
         self.refresh_sidebar()
 
     def setup_menu(self):
@@ -1579,20 +1554,20 @@ class MainWindow(QWidget):
         
         db_menu = menubar.addMenu("Database")
 
-        action_settings = QAction("\u2699\uFE0F Settings", self)
+        action_settings = QAction(qta.icon('fa5s.cog'), " Settings", self)
         action_settings.triggered.connect(self.open_settings)
         db_menu.addAction(action_settings)
 
-        action_builder = QAction("\U0001F6E0\uFE0F Class Builder", self)
+        action_builder = QAction(qta.icon('fa5s.tools'), " Class Builder", self)
         action_builder.triggered.connect(self.open_builder)
         db_menu.addAction(action_builder)
         
-        action_module = QAction("\U0001F4BB Module Builder", self)
+        action_module = QAction(qta.icon('fa5s.file-code'), " Module Builder", self)
         action_module.triggered.connect(self.open_module_builder)
         db_menu.addAction(action_module)
 
         doc_menu = menubar.addMenu("Documentation")
-        action_api = QAction("\U0001F4D6 Module API", self)
+        action_api = QAction(qta.icon('fa5s.book'), " Module API", self)
         action_api.triggered.connect(self.open_module_api)
         doc_menu.addAction(action_api)
 
@@ -1610,27 +1585,21 @@ class MainWindow(QWidget):
         db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
         dialog = ModuleBuilderDialog(db_path, self)
         dialog.exec()
+        self.refresh_module_sidebar()
         
     def open_module_api(self):
         QMessageBox.information(self, "Module API", "Documentation coming soon...\n\nCurrently available built-in functions:\n\nget_objects(class_name)\n-> Returns a complete Pandas DataFrame of the specified class, including automatically resolved multi-title relationships.")
 
     def sync_all_classes(self, db_path):
-        """
-        Runs on startup. Resolves 'Look-through' dependencies via a TOPOLOGICAL SORT, 
-        ensuring classes are synchronized in their exact dependency order.
-        Aggregates operational SQL errors and surfaces them to the user.
-        """
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         
-        # 1. Gather all classes
         try:
             cur.execute("SELECT id, name FROM classes")
             classes = {row[0]: row[1] for row in cur.fetchall()}
         except sqlite3.OperationalError:
             classes = {}
             
-        # 2. Build Dependency Graph (A depends on B if A looks through to B)
         dependencies = {cid: set() for cid in classes}
         try:
             cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
@@ -1638,19 +1607,17 @@ class MainWindow(QWidget):
                 if lookup:
                     tgt_class_name = lookup.split('.')[0].strip().lower()
                     for t_id, t_name in classes.items():
-                        if t_name.lower() == tgt_class_name:
-                            dependencies[cid].add(t_id)
+                        if t_name.lower() == tgt_class_name: dependencies[cid].add(t_id)
         except sqlite3.OperationalError:
-            pass # Schema not fully created yet
+            pass 
             
-        # 3. Topological Sort (Kahn's / DFS approach)
         ordered_cids = []
         visited = set()
         temp_mark = set()
         cycle_detected = False
         
         def visit(n):
-            if n in temp_mark: return False # Cycle
+            if n in temp_mark: return False 
             if n not in visited:
                 temp_mark.add(n)
                 for m in dependencies.get(n, set()):
@@ -1666,13 +1633,9 @@ class MainWindow(QWidget):
                     cycle_detected = True
                     break
                     
-        if cycle_detected:
-            # Failsafe if the Builder cycle detection was bypassed somehow
-            ordered_cids = list(classes.keys())
-            
+        if cycle_detected: ordered_cids = list(classes.keys())
         conn.close()
         
-        # 4. Sync Sequentially & Aggregate Errors
         sync_errors = []
         for cid in ordered_cids:
             try:
@@ -1680,7 +1643,6 @@ class MainWindow(QWidget):
             except Exception as e:
                 sync_errors.append(f"Class '{classes[cid]}': {str(e)}")
                 
-        # 5. UI ERROR AGGREGATION NOTIFICATION
         if sync_errors:
             error_msg = "The following configuration errors were detected during sync. Some views might not load perfectly until you fix their schemas:\n\n" + "\n".join(sync_errors)
             QMessageBox.warning(self, "Database Schema Warnings", error_msg)
@@ -1694,13 +1656,11 @@ class MainWindow(QWidget):
             db_path = os.path.join(os.path.expanduser("~"), "nexus_default.db")
             settings.setValue("db_path", db_path)
             
-        if not os.path.exists(db_path):
-            init_db(db_path)
+        if not os.path.exists(db_path): init_db(db_path)
 
-        if QSqlDatabase.contains():
-            db = QSqlDatabase.database()
-        else:
-            db = QSqlDatabase.addDatabase("QSQLITE")
+        if QSqlDatabase.contains(): db = QSqlDatabase.database()
+        else: db = QSqlDatabase.addDatabase("QSQLITE")
+        
         db.setDatabaseName(db_path)
         if not db.open(): return
 
@@ -1710,7 +1670,6 @@ class MainWindow(QWidget):
         cur = conn.cursor()
         try:
             cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
-            
             root_items = {}
             parent_item = self.sidebar.invisibleRootItem()
             
@@ -1726,28 +1685,142 @@ class MainWindow(QWidget):
                         current_path = f"{current_path}/{part}" if current_path else part
                         
                         if current_path not in root_items:
-                            folder_item = QTreeWidgetItem([f"\U0001F4C1 {part}"])
+                            folder_item = QTreeWidgetItem([part])
+                            folder_item.setIcon(0, qta.icon('fa5s.folder', color='#FFC107'))
                             current_parent.addChild(folder_item)
                             root_items[current_path] = folder_item
                         
                         current_parent = root_items[current_path]
                 
-                class_item = QTreeWidgetItem([f"\U0001F4C4 {c_name}"])
+                class_item = QTreeWidgetItem([c_name])
+                class_item.setIcon(0, qta.icon('fa5s.file-alt', color='#4CAF50'))
                 class_item.setData(0, Qt.UserRole, c_id)
                 current_parent.addChild(class_item)
                 
             self.sidebar.expandAll()
             
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e).lower():
+                print(f"Sidebar loading error: {e}")
+        finally:
+            conn.close()
+            
+        self.refresh_module_sidebar()
+
+    def refresh_module_sidebar(self):
+        self.module_sidebar.clear()
+        settings = QSettings("MyCompany", "DatabaseManagerApp")
+        db_path = settings.value("db_path", "")
+        if not db_path or not os.path.exists(db_path): return
+        
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, name, path FROM modules ORDER BY path ASC, name ASC")
+            root_items = {}
+            parent_item = self.module_sidebar.invisibleRootItem()
+            
+            for mid, mname, mpath in cur.fetchall():
+                mpath = (mpath or "").strip().strip('/')
+                current_parent = parent_item
+                
+                if mpath:
+                    current_path = ""
+                    for part in mpath.split('/'):
+                        part = part.strip()
+                        if not part: continue
+                        current_path = f"{current_path}/{part}" if current_path else part
+                        
+                        if current_path not in root_items:
+                            folder_item = QTreeWidgetItem([part])
+                            folder_item.setIcon(0, qta.icon('fa5s.folder', color='#FFC107'))
+                            current_parent.addChild(folder_item)
+                            root_items[current_path] = folder_item
+                        current_parent = root_items[current_path]
+                
+                item = QTreeWidgetItem([mname])
+                item.setIcon(0, qta.icon('fa5s.file-code', color='#2196F3'))
+                item.setData(0, Qt.UserRole, mid)
+                current_parent.addChild(item)
+                
+            self.module_sidebar.expandAll()
         except sqlite3.OperationalError:
-            pass 
+            pass
         finally:
             conn.close()
 
     def change_class(self, item, column):
         class_id = item.data(0, Qt.UserRole)
         if class_id:
-            class_name = item.text(0).replace("📄 ", "") 
+            class_name = item.text(0)
             self.data_browser.load_table_data(class_id, class_name)
+
+    def show_module_context_menu(self, position):
+        item = self.module_sidebar.itemAt(position)
+        if not item: return
+        mid = item.data(0, Qt.UserRole)
+        if not mid: return 
+        
+        menu = QMenu()
+        act_run = menu.addAction(qta.icon('fa5s.play', color='green'), "Run Script")
+        act_edit = menu.addAction(qta.icon('fa5s.edit'), "Edit Script in Builder")
+        
+        action = menu.exec(self.module_sidebar.viewport().mapToGlobal(position))
+        if action == act_run:
+            self.run_module_by_id(mid)
+        elif action == act_edit:
+            self.open_module_builder()
+
+    def run_module_by_id(self, mid):
+        settings = QSettings("MyCompany", "DatabaseManagerApp")
+        db_path = settings.value("db_path", "")
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT name, code FROM modules WHERE id = ?", (mid,))
+        row = cur.fetchone()
+        conn.close()
+        
+        if not row or not row[1]:
+            QMessageBox.warning(self, "Warning", "Module script is empty or missing.")
+            return
+            
+        mname, code = row
+        out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
+        
+        # Load get_objects properly
+        def local_get_objects(class_name):
+            if pd is None: raise ImportError("Pandas library is not installed.")
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM classes WHERE name = ?", (class_name,))
+            r = cur.fetchone()
+            if not r:
+                conn.close()
+                raise ValueError(f"Class '{class_name}' not found.")
+            cls_id = r[0]
+            conn.close()
+            
+            view_name, safe_table_name = sync_physical_table(db_path, cls_id, class_name, parent_widget=self)
+            if not view_name: raise RuntimeError(f"Failed to sync schema for '{class_name}'.")
+                
+            full_view_name = f"full_view_{safe_table_name}"
+            conn = sqlite3.connect(db_path)
+            df = pd.read_sql_query(f"SELECT * FROM {full_view_name}", conn)
+            conn.close()
+            return df
+            
+        context = {'get_objects': local_get_objects, 'pd': pd}
+        
+        try:
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(f"--- Running Module: {mname} at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
+                with redirect_stdout(f), redirect_stderr(f): exec(code, context)
+            QMessageBox.information(self, "Success", f"Script '{mname}' executed successfully.\nOutput saved to:\n{out_path}")
+        except Exception as e:
+            with open(out_path, 'a', encoding='utf-8') as f:
+                f.write("\n\n--- RUNTIME ERROR ---\n")
+                traceback.print_exc(file=f)
+            QMessageBox.warning(self, "Script Error", f"An error occurred during execution of '{mname}'.\nCheck the output file for details:\n{out_path}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
