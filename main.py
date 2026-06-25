@@ -1,6 +1,7 @@
 import sys
 import sqlite3
 import os
+import re
 import csv
 import ast
 import datetime
@@ -17,13 +18,13 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
     QTreeWidget, QTreeWidgetItem, QPushButton, QLineEdit, QLabel, QTableView, 
     QHeaderView, QMessageBox, QFileDialog, QListWidget, QListWidgetItem, QDialog,
-    QSplitter, QScrollArea, QComboBox, QInputDialog, QFormLayout, QSpinBox, 
+    QSplitter, QScrollArea, QComboBox, QInputDialog, QFormLayout, QSpinBox,
     QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit, QTabWidget,
-    QMenuBar, QMenu
+    QMenuBar, QMenu, QRadioButton, QGroupBox, QDialogButtonBox, QTextBrowser
 )
-from PySide6.QtCore import Qt, QSettings, QDateTime
+from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
-from PySide6.QtGui import QAction, QFontDatabase, QFont
+from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValidator
 
 from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon, sanitize_name, qid
 
@@ -49,7 +50,7 @@ def safe_convert(val, app_type):
             return False, None
         else:
             return True, str(val)
-    except:
+    except (ValueError, SyntaxError, TypeError):
         return False, None
 
 def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
@@ -58,13 +59,15 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         
-        cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
+        cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
         attributes = cur.fetchall()
-        
+
         required_cols = []
         attr_app_types = {}
-        
-        for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
+        unique_flags = {}    # safe_col_name -> bool (enforced via UNIQUE index)
+        required_flags = {}  # safe_col_name -> bool (enforced via NOT NULL when feasible)
+
+        for attr_name, attr_type, show_in_table, is_title, lookup_query, is_unique, is_required in attributes:
             safe_col_name = sanitize_name(attr_name)
             if attr_type == "look-through":
                 attr_app_types[safe_col_name] = attr_type
@@ -79,26 +82,65 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             if attr_type in ("int", "boolean"): sql_type = "INTEGER"
             elif attr_type == "float": sql_type = "REAL"
             else: sql_type = "TEXT"
-                
+
             required_cols.append((safe_col_name, sql_type))
             attr_app_types[safe_col_name] = attr_type
+            unique_flags[safe_col_name] = bool(is_unique)
+            required_flags[safe_col_name] = bool(is_required)
+
+        def make_cols_def(notnull_map):
+            return ", ".join([f"{qid(c)} {t}" + (" NOT NULL" if notnull_map.get(c) else "") for c, t in required_cols])
 
         cur.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name=?", (safe_table_name,))
         if cur.fetchone()[0] == 0:
-            cols_def = ", ".join([f"{qid(c)} {t}" for c, t in required_cols])
+            # Fresh, empty table: every required column can safely carry NOT NULL.
+            desired_notnull = dict(required_flags)
+            cols_def = make_cols_def(desired_notnull)
             cur.execute(f"CREATE TABLE {qid(safe_table_name)} (id INTEGER PRIMARY KEY AUTOINCREMENT{', ' + cols_def if cols_def else ''})")
         else:
             cur.execute(f"PRAGMA table_info({qid(safe_table_name)})")
-            existing_cols = {row[1]: row[2] for row in cur.fetchall()}
-            
+            info_rows = cur.fetchall()
+            existing_cols = {row[1]: row[2] for row in info_rows}
+            existing_notnull = {row[1]: row[3] for row in info_rows}
+
+            cur.execute(f"SELECT COUNT(*) FROM {qid(safe_table_name)}")
+            table_has_rows = cur.fetchone()[0] > 0
+
             type_mismatches = []
             for col_name, sql_type in required_cols:
                 if col_name in existing_cols and existing_cols[col_name] != sql_type:
                     type_mismatches.append(col_name)
-                    
+
             cols_to_remove = set(existing_cols.keys()) - {c for c, t in required_cols} - {'id'}
-                    
-            if type_mismatches or cols_to_remove:
+
+            # Decide the NOT NULL constraint we actually want per column, degrading to
+            # nullable wherever enforcing it could break existing data (so a rebuild can
+            # never fail on a NOT NULL violation).
+            desired_notnull = {}
+            notnull_changes = []
+            for col_name, sql_type in required_cols:
+                want = required_flags.get(col_name, False)
+                if want:
+                    if col_name not in existing_cols:
+                        # New column: only enforceable while the table is still empty.
+                        if table_has_rows: want = False
+                    elif col_name in type_mismatches:
+                        # Conversion may null out incompatible values.
+                        want = False
+                    elif table_has_rows:
+                        cur.execute(f"SELECT 1 FROM {qid(safe_table_name)} WHERE {qid(col_name)} IS NULL LIMIT 1")
+                        if cur.fetchone(): want = False
+                desired_notnull[col_name] = want
+
+                if col_name in existing_cols:
+                    if bool(existing_notnull.get(col_name, 0)) != want:
+                        notnull_changes.append(col_name)
+                elif want:
+                    # New required column on an empty table -> rebuild to create it NOT NULL
+                    # (ALTER TABLE ADD COLUMN cannot add a NOT NULL column without a default).
+                    notnull_changes.append(col_name)
+
+            if type_mismatches or cols_to_remove or notnull_changes:
                 conversion_failures = 0
                 if type_mismatches:
                     type_mismatches_escaped = ", ".join([qid(c) for c in type_mismatches])
@@ -149,8 +191,8 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                     
                     new_table = f"new_{safe_table_name}"
                     cur.execute(f"DROP TABLE IF EXISTS {qid(new_table)}")
-                    
-                    cols_def = ", ".join([f"{qid(c)} {t}" for c, t in required_cols])
+
+                    cols_def = make_cols_def(desired_notnull)
                     cur.execute(f"CREATE TABLE {qid(new_table)} (id INTEGER PRIMARY KEY AUTOINCREMENT{', ' + cols_def if cols_def else ''})")
                     
                     common_cols = list(set(existing_cols.keys()).intersection([c for c, t in required_cols]))
@@ -193,6 +235,29 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                     if col_name not in existing_cols:
                         cur.execute(f"ALTER TABLE {qid(safe_table_name)} ADD COLUMN {qid(col_name)} {col_type}")
 
+        # --- Schema-level UNIQUE enforcement via standalone indexes ---
+        # (ALTER TABLE cannot add a UNIQUE column, so unique constraints live in indexes
+        # named ux_<table>_<col>. SQLite unique indexes treat multiple NULLs as distinct,
+        # which matches the app's "uniqueness ignores empty values" behaviour.)
+        ux_prefix = f"ux_{safe_table_name}_"
+        cur.execute(f"PRAGMA index_list({qid(safe_table_name)})")
+        existing_index_names = [r[1] for r in cur.fetchall()]
+        desired_unique_cols = [c for c, _t in required_cols if unique_flags.get(c)]
+
+        for idx_name in existing_index_names:
+            if idx_name.startswith(ux_prefix) and idx_name[len(ux_prefix):] not in desired_unique_cols:
+                cur.execute(f"DROP INDEX IF EXISTS {qid(idx_name)}")
+
+        for c in desired_unique_cols:
+            idx_name = ux_prefix + c
+            if idx_name not in existing_index_names:
+                try:
+                    cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {qid(idx_name)} ON {qid(safe_table_name)} ({qid(c)})")
+                except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                    # Existing duplicate values (app-level checks normally prevent this).
+                    # Skip schema-level enforcement rather than abort the whole sync.
+                    pass
+
         # Outgoing relationships uses show_in_base
         cur.execute("SELECT c.name, r.rel_type, c.id, r.show_in_base FROM relationships r JOIN classes c ON r.target_class = c.id WHERE r.source_class = ? ORDER BY r.row_order", (class_id,))
         outgoing_rels = cur.fetchall()
@@ -218,7 +283,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             cur.execute(f"CREATE TABLE IF NOT EXISTS {qid(junc_table)} (id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER, target_id INTEGER, FOREIGN KEY(source_id) REFERENCES {qid('objects_' + safe_source_name)}(id) ON DELETE CASCADE, FOREIGN KEY(target_id) REFERENCES {qid(safe_table_name)}(id) ON DELETE CASCADE)")
 
         base_selects = ["m.id AS [ID]"]
-        for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
+        for attr_name, attr_type, show_in_table, is_title, lookup_query, is_unique, is_required in attributes:
             safe_col_name = sanitize_name(attr_name)
             if attr_type == "look-through":
                 if lookup_query:
@@ -227,8 +292,15 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                         tgt_class, tgt_attr = parts
                         safe_tgt_class = sanitize_name(tgt_class.strip())
                         junc_table = f"rel_{safe_table_name}_to_objects_{safe_tgt_class}"
-                        subquery = f"(SELECT GROUP_CONCAT(tgt_v.{qid(tgt_attr.strip())}) FROM {qid(junc_table)} j JOIN {qid('base_view_objects_' + safe_tgt_class)} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = m.id)"
-                        base_selects.append(f"{subquery} AS {qid(attr_name)}")
+                        # A look-through resolves through the relationship's junction table.
+                        # If no such relationship exists (junction missing), fall back to NULL
+                        # so existing data still loads instead of breaking the whole view.
+                        cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (junc_table,))
+                        if cur.fetchone():
+                            subquery = f"(SELECT GROUP_CONCAT(tgt_v.{qid(tgt_attr.strip())}) FROM {qid(junc_table)} j JOIN {qid('base_view_objects_' + safe_tgt_class)} tgt_v ON j.target_id = tgt_v.[ID] WHERE j.source_id = m.id)"
+                            base_selects.append(f"{subquery} AS {qid(attr_name)}")
+                        else:
+                            base_selects.append(f"NULL AS {qid(attr_name)}")
                     else:
                         raise ValueError(f"Invalid lookup format '{lookup_query}'. Expected 'TargetClass.Attribute'.")
                 else:
@@ -243,7 +315,7 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
         ui_selects = ["v.[ID]"]
         full_selects = ["v.[ID]"]
 
-        for attr_name, attr_type, show_in_table, is_title, lookup_query in attributes:
+        for attr_name, attr_type, show_in_table, is_title, lookup_query, is_unique, is_required in attributes:
             col_sql = f"v.{qid(attr_name)}"
             if show_in_table: ui_selects.append(col_sql)
             full_selects.append(col_sql)
@@ -297,6 +369,49 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     return view_name, safe_table_name
 
 
+class NullableDateTimeEdit(QWidget):
+    """A date/time editor that can represent 'no value' (NULL).
+
+    A checkbox toggles whether a date is set. New objects default to checked
+    with the current date/time; unchecking stores NULL.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.check = QCheckBox()
+        self.check.setToolTip("Tick to set a date/time, untick for no date (empty / NULL).")
+        self.edit = QDateTimeEdit()
+        self.edit.setCalendarPopup(True)
+        self.edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.edit.setDateTime(QDateTime.currentDateTime())
+
+        lay.addWidget(self.check)
+        lay.addWidget(self.edit, 1)
+
+        self.check.toggled.connect(self.edit.setEnabled)
+        self.check.setChecked(True)
+        self.edit.setEnabled(True)
+
+    def value(self):
+        """Return the formatted string, or None when no date is set."""
+        if not self.check.isChecked():
+            return None
+        return self.edit.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+
+    def set_value(self, val):
+        if val is None or str(val).strip() == "":
+            self.check.setChecked(False)
+            self.edit.setEnabled(False)
+        else:
+            dt = QDateTime.fromString(str(val), "yyyy-MM-dd HH:mm:ss")
+            if dt.isValid():
+                self.edit.setDateTime(dt)
+            self.check.setChecked(True)
+            self.edit.setEnabled(True)
+
+
 class ObjectEditorDialog(QDialog):
     def __init__(self, db_path, class_id, class_name, table_name, obj_id=None, parent=None):
         super().__init__(parent)
@@ -345,18 +460,21 @@ class ObjectEditorDialog(QDialog):
                 }
                 
                 if attr_type == "int":
-                    widget = QSpinBox()
-                    widget.setRange(-2147483648, 2147483647) 
+                    # Plain text + validator instead of QSpinBox: QSpinBox is limited to
+                    # 32-bit and silently clamps, whereas SQLite INTEGER is 64-bit. Parsing
+                    # in Python keeps the full range with no silent data loss.
+                    widget = QLineEdit()
+                    widget.setValidator(QRegularExpressionValidator(QRegularExpression(r'^-?\d*$')))
+                    widget.setPlaceholderText("Whole number")
                 elif attr_type == "float":
-                    widget = QDoubleSpinBox()
-                    widget.setRange(-1e9, 1e9)
-                    widget.setDecimals(4)
+                    # Likewise avoids QDoubleSpinBox's range cap and 4-decimal rounding.
+                    widget = QLineEdit()
+                    widget.setValidator(QRegularExpressionValidator(QRegularExpression(r'^-?\d*\.?\d*([eE][-+]?\d+)?$')))
+                    widget.setPlaceholderText("Number")
                 elif attr_type == "boolean":
                     widget = QCheckBox("Yes / True")
                 elif attr_type == "date":
-                    widget = QDateTimeEdit()
-                    widget.setCalendarPopup(True) 
-                    widget.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+                    widget = NullableDateTimeEdit()
                 elif attr_type == "long string":
                     widget = QTextEdit()
                     widget.setMaximumHeight(100) 
@@ -448,15 +566,13 @@ class ObjectEditorDialog(QDialog):
                         for idx, col in enumerate(cols):
                             val = row[idx]
                             widget = self.input_widgets[col]
-                            
-                            if val is not None:
-                                if isinstance(widget, QSpinBox) or isinstance(widget, QDoubleSpinBox):
-                                    widget.setValue(val)
-                                elif isinstance(widget, QCheckBox):
+
+                            if isinstance(widget, NullableDateTimeEdit):
+                                # Always call (even for None) so a stored NULL unticks the box.
+                                widget.set_value(val)
+                            elif val is not None:
+                                if isinstance(widget, QCheckBox):
                                     widget.setChecked(bool(val))
-                                elif isinstance(widget, QDateTimeEdit):
-                                    dt = QDateTime.fromString(str(val), "yyyy-MM-dd HH:mm:ss")
-                                    if dt.isValid(): widget.setDateTime(dt)
                                 elif isinstance(widget, QTextEdit):
                                     widget.setPlainText(str(val))
                                 else:
@@ -514,20 +630,17 @@ class ObjectEditorDialog(QDialog):
                     constraints = self.attr_constraints.get(col_name)
                     attr_display_name = constraints['name']
                     
-                    if isinstance(widget, QSpinBox) or isinstance(widget, QDoubleSpinBox):
-                        val = widget.value()
-                        is_empty = False 
-                    elif isinstance(widget, QCheckBox):
+                    if isinstance(widget, QCheckBox):
                         val = 1 if widget.isChecked() else 0
                         is_empty = False
-                    elif isinstance(widget, QDateTimeEdit):
-                        val = widget.dateTime().toString("yyyy-MM-dd HH:mm:ss")
-                        is_empty = False
+                    elif isinstance(widget, NullableDateTimeEdit):
+                        val = widget.value()
+                        is_empty = (val is None)
                     elif isinstance(widget, QTextEdit):
                         raw_text = widget.toPlainText().strip()
                         is_empty = (raw_text == "")
                         val = None if is_empty else raw_text
-                    else: 
+                    else:
                         raw_text = widget.text().strip()
                         is_empty = (raw_text == "")
                         if is_empty:
@@ -537,7 +650,7 @@ class ObjectEditorDialog(QDialog):
                                 try:
                                     parsed = ast.literal_eval(raw_text)
                                     if not isinstance(parsed, list): raise ValueError("Not a list.")
-                                        
+
                                     if app_type == "matrix":
                                         expected_cols = self.matrix_col_counts.get(col_name, 0)
                                         if len(parsed) != expected_cols:
@@ -548,7 +661,19 @@ class ObjectEditorDialog(QDialog):
                                 except Exception as e:
                                     err_msg = str(e) if str(e) else "Invalid Python syntax."
                                     QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' parsing failed: {err_msg}\n\nExample: [['A', 'B'], [1, 2]]")
-                                    return 
+                                    return
+                            elif app_type == "int":
+                                try:
+                                    val = int(raw_text)
+                                except ValueError:
+                                    QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' must be a whole number.")
+                                    return
+                            elif app_type == "float":
+                                try:
+                                    val = float(raw_text)
+                                except ValueError:
+                                    QMessageBox.warning(self, "Validation Error", f"'{attr_display_name}' must be a number.")
+                                    return
                             else: val = raw_text
 
                     if constraints['required'] and is_empty:
@@ -932,6 +1057,115 @@ class ModuleBuilderDialog(QDialog):
             QMessageBox.warning(self, "Script Error", f"An error occurred during execution.\nCheck the output file for details:\n{out_path}")
 
 
+class ExportOptionsDialog(QDialog):
+    """Lets the user pick what to export and in which shape."""
+    def __init__(self, parent=None, has_filter=False):
+        super().__init__(parent)
+        self.setWindowTitle("Export Options")
+        self.setWindowIcon(get_app_icon())
+        self.resize(440, 360)
+
+        layout = QVBoxLayout(self)
+
+        layout_box = QGroupBox("Layout")
+        lb = QVBoxLayout(layout_box)
+        self.rb_layout_import = QRadioButton("Import-ready (round-trip)")
+        self.rb_layout_import.setChecked(True)
+        self.rb_layout_import.setToolTip("Attribute names as headers + relationship IDs. This file can be re-imported.")
+        self.rb_layout_full = QRadioButton("Full display view (for reading)")
+        self.rb_layout_full.setToolTip("Everything currently visible, including titles and incoming links. Not re-importable.")
+        lb.addWidget(self.rb_layout_import)
+        lb.addWidget(self.rb_layout_full)
+        layout.addWidget(layout_box)
+
+        rows_box = QGroupBox("Rows")
+        rb = QVBoxLayout(rows_box)
+        self.rb_rows_all = QRadioButton("All rows")
+        self.rb_rows_all.setChecked(True)
+        self.rb_rows_filter = QRadioButton("Current filter / search only")
+        self.rb_rows_filter.setEnabled(has_filter)
+        if not has_filter:
+            self.rb_rows_filter.setToolTip("No active search filter.")
+        rb.addWidget(self.rb_rows_all)
+        rb.addWidget(self.rb_rows_filter)
+        layout.addWidget(rows_box)
+
+        fmt_box = QGroupBox("Format")
+        fb = QHBoxLayout(fmt_box)
+        self.rb_fmt_xlsx = QRadioButton("Excel (.xlsx)")
+        self.rb_fmt_xlsx.setChecked(True)
+        self.rb_fmt_csv = QRadioButton("CSV (.csv)")
+        fb.addWidget(self.rb_fmt_xlsx)
+        fb.addWidget(self.rb_fmt_csv)
+        layout.addWidget(fmt_box)
+
+        self.cb_template = QCheckBox("Template only (column headers, no data)")
+        self.cb_template.setToolTip("Produce an empty file with the correct headers to fill in and import.")
+        layout.addWidget(self.cb_template)
+
+        buttons = QDialogButtonBox()
+        btn_export = buttons.addButton(" Export...", QDialogButtonBox.AcceptRole)
+        btn_export.setIcon(qta.icon('fa5s.file-export'))
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addStretch()
+        layout.addWidget(buttons)
+
+    def get_options(self):
+        return {
+            'import_ready': self.rb_layout_import.isChecked(),
+            'rows_filtered': self.rb_rows_filter.isChecked() and self.rb_rows_filter.isEnabled(),
+            'fmt': 'xlsx' if self.rb_fmt_xlsx.isChecked() else 'csv',
+            'template': self.cb_template.isChecked(),
+        }
+
+
+class ImportPreviewDialog(QDialog):
+    """Shows how the chosen file maps onto the class before anything is written."""
+    def __init__(self, parent, analysis):
+        super().__init__(parent)
+        self.setWindowTitle("Import Preview")
+        self.setWindowIcon(get_app_icon())
+        self.resize(560, 480)
+
+        layout = QVBoxLayout(self)
+        report = QTextBrowser()
+        report.setOpenExternalLinks(False)
+
+        html = [f"<p><b>File:</b> {analysis['file']}<br><b>Data rows:</b> {analysis['data_count']}</p>"]
+
+        if analysis['problems']:
+            html.append("<p style='color:#c0392b;'><b>Cannot import yet:</b></p><ul>")
+            for p in analysis['problems']:
+                html.append(f"<li style='color:#c0392b;'>{p}</li>")
+            html.append("</ul>")
+
+        html.append("<p><b>Columns detected:</b></p><ul>")
+        kind_color = {"ok": "#2e7d32", "key": "#1565c0", "ignore": "#888888"}
+        for disp, label, kind in analysis['columns']:
+            color = kind_color.get(kind, "#000000")
+            html.append(f"<li><b>{disp}</b> &rarr; <span style='color:{color};'>{label}</span></li>")
+        html.append("</ul>")
+
+        html.append(
+            "<p style='color:#555;'>Rows with a value in the <b>ID</b> column update the matching "
+            "object; rows with an empty ID are added as new. Columns marked <i>ignored</i> are skipped. "
+            "Relationship cells accept comma-separated IDs (or a single-title name).</p>"
+        )
+        report.setHtml("".join(html))
+        layout.addWidget(report)
+
+        buttons = QDialogButtonBox()
+        self.btn_import = buttons.addButton(" Import", QDialogButtonBox.AcceptRole)
+        self.btn_import.setIcon(qta.icon('fa5s.file-import'))
+        self.btn_import.setEnabled(analysis['can_import'])
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class DataBrowserPage(QWidget):
     def __init__(self, main_window): 
         super().__init__()
@@ -964,8 +1198,21 @@ class DataBrowserPage(QWidget):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Filter text...")
         self.search_input.returnPressed.connect(self.trigger_search)
-        
-        self.btn_search = QPushButton(" Search") 
+
+        # VS Code-style search toggles.
+        self.btn_match_case = QPushButton("Aa")
+        self.btn_match_case.setCheckable(True)
+        self.btn_match_case.setFixedWidth(34)
+        self.btn_match_case.setToolTip("Match Case")
+        self.btn_match_case.toggled.connect(self.trigger_search)
+
+        self.btn_whole_word = QPushButton("ab|")
+        self.btn_whole_word.setCheckable(True)
+        self.btn_whole_word.setFixedWidth(34)
+        self.btn_whole_word.setToolTip("Match Whole Word")
+        self.btn_whole_word.toggled.connect(self.trigger_search)
+
+        self.btn_search = QPushButton(" Search")
         self.btn_search.setIcon(qta.icon('fa5s.search'))
         self.btn_search.clicked.connect(self.trigger_search)
         
@@ -998,6 +1245,8 @@ class DataBrowserPage(QWidget):
         search_layout.addWidget(QLabel("Search In:"))
         search_layout.addWidget(self.col_combo)
         search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.btn_match_case)
+        search_layout.addWidget(self.btn_whole_word)
         search_layout.addWidget(self.btn_search)
         search_layout.addWidget(self.btn_import)
         search_layout.addWidget(self.btn_export)
@@ -1068,7 +1317,11 @@ class DataBrowserPage(QWidget):
         self.btn_delete.setEnabled(False)
         
         self.db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
-        
+
+        # Release any read lock the Qt view holds on the old class's view before the
+        # schema sync runs DDL on this database file (belt-and-suspenders alongside WAL).
+        self.query_model.clear()
+
         try:
             self.current_view_name, self.current_table_name = sync_physical_table(self.db_path, class_id, class_name, parent_widget=self)
             
@@ -1109,33 +1362,150 @@ class DataBrowserPage(QWidget):
         
         self.build_and_exec_query()
 
+    @staticmethod
+    def _glob_escape(s):
+        # GLOB has no ESCAPE clause; wrap each metachar in a one-char class to match it literally.
+        out = []
+        for ch in s:
+            out.append(f"[{ch}]" if ch in "*?[" else ch)
+        return "".join(out)
+
+    @staticmethod
+    def _like_escape(s):
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _build_text_condition(self, col_sql, search_text):
+        """Build a (sql_condition, params) pair honouring the Match Case / Whole Word toggles.
+
+        The same expression is used by both the COUNT and the data query, so paging stays
+        consistent. Works on both the sqlite3 and the Qt connection (it's plain SQLite SQL).
+        Case-insensitive matching is ASCII-only, the same limitation LIKE already had.
+        """
+        match_case = self.btn_match_case.isChecked()
+        whole_word = self.btn_whole_word.isChecked()
+        col_expr = f"CAST({col_sql} AS TEXT)"
+
+        if whole_word:
+            boundary = "[^A-Za-z0-9_]"
+            term = self._glob_escape(search_text)
+            if not match_case:
+                col_expr = f"LOWER({col_expr})"
+                term = term.lower()
+            patterns = [
+                term,                                      # whole value equals the word
+                f"{term}{boundary}*",                      # word at the start
+                f"*{boundary}{term}",                      # word at the end
+                f"*{boundary}{term}{boundary}*",           # word in the middle
+            ]
+            cond = "(" + " OR ".join([f"{col_expr} GLOB ?"] * len(patterns)) + ")"
+            return cond, patterns
+
+        if match_case:
+            # INSTR is case- and accent-sensitive (binary), i.e. true "match case".
+            return f"INSTR({col_expr}, ?) > 0", [search_text]
+
+        esc = self._like_escape(search_text)
+        return f"{col_expr} LIKE ? ESCAPE '\\'", [f"%{esc}%"]
+
+    def _build_search_where(self, cur):
+        """Build the WHERE clause for the current search box, honouring the toggles.
+
+        Returns (where_sql, params); where_sql is '' or starts with ' WHERE '.
+        Shared by the table view and 'current filter only' exports so they agree.
+        """
+        where_clauses = []
+        params = []
+        search_text = self.search_input.text().strip()
+        if search_text:
+            col_idx = self.col_combo.currentData()
+            if col_idx == -1:
+                cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
+                col_names = [row[1] for row in cur.fetchall()]
+                or_clauses = []
+                for c in col_names:
+                    cond, cond_params = self._build_text_condition(qid(c), search_text)
+                    or_clauses.append(cond)
+                    params.extend(cond_params)
+                if or_clauses:
+                    where_clauses.append("(" + " OR ".join(or_clauses) + ")")
+            else:
+                col_name = self.col_combo.itemText(self.col_combo.currentIndex())
+                cond, cond_params = self._build_text_condition(qid(col_name), search_text)
+                where_clauses.append(cond)
+                params.extend(cond_params)
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        return where_sql, params
+
+    def _get_import_schema(self, cur):
+        """The canonical, round-trippable column schema for this class.
+
+        Returns (attributes, relationships, lookthrough_names) where the import-ready
+        header order is ['ID'] + [a.name for attributes] + [r.name for relationships].
+        """
+        cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (self.current_class_id,))
+        attr_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT a.name, COUNT(m.id) FROM attributes a
+            JOIN matrix_columns m ON a.id = m.attribute_id
+            WHERE a.class_id = ? GROUP BY a.id
+        """, (self.current_class_id,))
+        matrix_counts = {r[0]: r[1] for r in cur.fetchall()}
+
+        attributes = []
+        lookthrough_names = []
+        for aid, name, dtype, uniq, req in attr_rows:
+            if dtype == "look-through":
+                lookthrough_names.append(name)
+                continue
+            attributes.append({
+                "name": name, "safe": sanitize_name(name), "type": dtype,
+                "unique": bool(uniq), "required": bool(req),
+                "matrix_count": matrix_counts.get(name, 0),
+            })
+
+        cur.execute("""
+            SELECT c.id, c.name FROM relationships r
+            JOIN classes c ON r.target_class = c.id
+            WHERE r.source_class = ? ORDER BY r.row_order
+        """, (self.current_class_id,))
+        relationships = []
+        seen = set()
+        for tcid, tname in cur.fetchall():
+            safe_t = sanitize_name(tname)
+            if safe_t in seen:
+                continue
+            seen.add(safe_t)
+            cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (tcid,))
+            title_cols = [r[0] for r in cur.fetchall()]
+            relationships.append({
+                "name": tname, "safe": safe_t,
+                "target_table": f"objects_{safe_t}",
+                "junc_table": f"rel_{self.current_table_name}_to_objects_{safe_t}",
+                "base_view": f"base_view_objects_{safe_t}",
+                "title_cols": title_cols,
+            })
+        return attributes, relationships, lookthrough_names
+
+    @staticmethod
+    def _cell_to_value(cell):
+        """Normalise a spreadsheet/CSV cell to a trimmed string or None."""
+        if isinstance(cell, datetime.datetime):
+            return cell.strftime("%Y-%m-%d %H:%M:%S")
+        if cell is None:
+            return None
+        s = str(cell).strip()
+        return s if s != "" else None
+
     def build_and_exec_query(self):
         if not self.current_view_name: return
         
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            
+
             base_query = f"FROM {qid(self.current_view_name)}"
-            where_clauses = []
-            params = []
-            
-            search_text = self.search_input.text().strip()
-            if search_text:
-                col_idx = self.col_combo.currentData()
-                if col_idx == -1: 
-                    cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
-                    col_names = [row[1] for row in cur.fetchall()]
-                    or_clauses = [f"{qid(c)} LIKE ?" for c in col_names]
-                    where_clauses.append("(" + " OR ".join(or_clauses) + ")")
-                    params.extend([f"%{search_text}%"] * len(col_names))
-                else: 
-                    col_name = self.col_combo.itemText(self.col_combo.currentIndex())
-                    where_clauses.append(f"{qid(col_name)} LIKE ?")
-                    params.append(f"%{search_text}%")
-            
-            where_sql = ""
-            if where_clauses: where_sql = " WHERE " + " AND ".join(where_clauses)
-                
+            where_sql, params = self._build_search_where(cur)
+
             count_query = f"SELECT COUNT(*) {base_query} {where_sql}"
             cur.execute(count_query, params)
             self.total_records = cur.fetchone()[0]
@@ -1278,203 +1648,356 @@ class DataBrowserPage(QWidget):
                 QMessageBox.critical(self, "Error", str(e))
 
     def export_data(self):
-        if not self.query_model: return
-        file_path, selected_filter = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV Files (*.csv);;Excel Files (*.xlsx)")
-        if not file_path: return
-        
-        if "csv" in selected_filter.lower() and not file_path.lower().endswith(".csv"): file_path += ".csv"
-        elif "excel" in selected_filter.lower() and not file_path.lower().endswith(".xlsx"): file_path += ".xlsx"
-            
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
-            headers = [row[1] for row in cur.fetchall()]
-            
-            cur.execute(f"SELECT * FROM {qid(self.current_view_name)} ORDER BY {qid(self.current_sort_col)} {self.current_sort_order}")
-            raw_data = cur.fetchall()
-        
-        data = [["" if v is None else str(v) for v in row] for row in raw_data]
+        if not self.current_view_name: return
 
-        if file_path.endswith(".csv"):
-            try:
-                with open(file_path, mode='w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(headers)
-                    writer.writerows(data)
-                QMessageBox.information(self, "Success", "Exported to CSV successfully!")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export: {e}")
-                
-        elif file_path.endswith(".xlsx"):
-            try:
-                import openpyxl
+        has_filter = bool(self.search_input.text().strip())
+        opt_dlg = ExportOptionsDialog(self, has_filter=has_filter)
+        if not opt_dlg.exec(): return
+        opts = opt_dlg.get_options()
+
+        ext = ".xlsx" if opts['fmt'] == 'xlsx' else ".csv"
+        filt = "Excel Files (*.xlsx)" if opts['fmt'] == 'xlsx' else "CSV Files (*.csv)"
+        default_name = f"{sanitize_name(self.current_class_name)}{'_template' if opts['template'] else ''}{ext}"
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Data", default_name, filt)
+        if not file_path: return
+        if not file_path.lower().endswith(ext): file_path += ext
+
+        try:
+            headers, rows = self._gather_export_rows(opts)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not gather data to export:\n\n{e}")
+            return
+
+        try:
+            if opts['fmt'] == 'xlsx':
+                try:
+                    import openpyxl
+                except ImportError:
+                    file_path = file_path[:-5] + ".csv" if file_path.lower().endswith(".xlsx") else file_path + ".csv"
+                    self._write_csv(file_path, headers, rows)
+                    QMessageBox.warning(self, "Exported as CSV",
+                        f"'openpyxl' is not installed, so the data was exported as CSV instead:\n{file_path}\n\n"
+                        "Install it (pip install openpyxl) for Excel export.")
+                    return
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.append(headers)
-                for row in data: ws.append(row)
+                for row in rows: ws.append(row)
                 wb.save(file_path)
-                QMessageBox.information(self, "Success", "Exported to Excel successfully!")
-            except ImportError:
-                QMessageBox.warning(self, "Missing Library", "The 'openpyxl' library is required to export to Excel.\nPlease install it via terminal: pip install openpyxl\n\nFalling back to CSV export...")
-                fallback_path = file_path.replace(".xlsx", ".csv")
-                with open(fallback_path, mode='w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(headers)
-                    writer.writerows(data)
-                QMessageBox.information(self, "Fallback", f"Exported to CSV instead at:\n{fallback_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to export: {e}")
+            else:
+                self._write_csv(file_path, headers, rows)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to write file:\n\n{e}")
+            return
 
-    def import_data(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Import Data", "", "Excel Files (*.xlsx)")
-        if not file_path: return
-        
+        what = "template" if opts['template'] else f"{len(rows)} row(s)"
+        QMessageBox.information(self, "Export Complete", f"Exported {what} to:\n{file_path}")
+
+    @staticmethod
+    def _write_csv(file_path, headers, rows):
+        with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(rows)
+
+    def _gather_export_rows(self, opts):
+        """Return (headers, rows) for the chosen export options."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+
+            if opts['import_ready']:
+                attrs, rels, _lookthroughs = self._get_import_schema(cur)
+                headers = ["ID"] + [a['name'] for a in attrs] + [r['name'] for r in rels]
+                if opts['template']:
+                    return headers, []
+
+                selects = ["m.id"]
+                selects += [f"m.{qid(a['safe'])}" for a in attrs]
+                selects += [f"(SELECT GROUP_CONCAT(target_id) FROM {qid(r['junc_table'])} WHERE source_id = m.id)" for r in rels]
+                sql = f"SELECT {', '.join(selects)} FROM {qid(self.current_table_name)} m"
+
+                params = []
+                if opts['rows_filtered']:
+                    where_sql, wparams = self._build_search_where(cur)
+                    cur.execute(f"SELECT [ID] FROM {qid(self.current_view_name)}{where_sql}", wparams)
+                    ids = [r[0] for r in cur.fetchall()]
+                    if not ids:
+                        return headers, []
+                    sql += f" WHERE m.id IN ({', '.join(['?'] * len(ids))})"
+                    params = ids
+                sql += " ORDER BY m.id ASC"
+                cur.execute(sql, params)
+                raw = cur.fetchall()
+            else:
+                cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
+                headers = [row[1] for row in cur.fetchall()]
+                if opts['template']:
+                    return headers, []
+                where_sql, params = self._build_search_where(cur) if opts['rows_filtered'] else ("", [])
+                order_sql = f"ORDER BY {qid(self.current_sort_col)} {self.current_sort_order}"
+                cur.execute(f"SELECT * FROM {qid(self.current_view_name)}{where_sql} {order_sql}", params)
+                raw = cur.fetchall()
+
+        return headers, [["" if v is None else str(v) for v in row] for row in raw]
+
+    def _read_table_file(self, file_path):
+        """Read an .xlsx or .csv file into a list of row-lists (header row first)."""
+        if file_path.lower().endswith(".csv"):
+            with open(file_path, newline='', encoding='utf-8-sig') as f:
+                return [list(r) for r in csv.reader(f)]
         try:
             import openpyxl
         except ImportError:
-            QMessageBox.critical(self, "Missing Library", "The 'openpyxl' library is required to import from Excel.\n\nPlease install it via terminal: pip install openpyxl")
+            raise RuntimeError("The 'openpyxl' library is required to read .xlsx files.\nInstall it with: pip install openpyxl")
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        ws = wb.active
+        return [list(r) for r in ws.iter_rows(values_only=True)]
+
+    def _analyze_import(self, all_rows, attrs, rels, lookthrough_names):
+        """Classify each column and decide whether the file can be imported."""
+        attr_by_safe = {a['safe']: a for a in attrs}
+        rel_by_safe = {r['safe']: r for r in rels}
+        look_safe = {sanitize_name(n) for n in lookthrough_names}
+
+        headers_raw = all_rows[0] if all_rows else []
+        col_map = []      # one entry per column: (kind, obj)
+        columns = []      # (display, label, kind) for the preview
+        seen = set()
+        duplicates = []
+        id_col_index = None
+        mapped_attr_safes = set()
+
+        for idx, h in enumerate(headers_raw):
+            disp = "" if h is None else str(h).strip()
+            s = sanitize_name(disp) if disp else ""
+            if not disp:
+                col_map.append(('blank', None)); continue
+            if s == "id":
+                id_col_index = idx
+                col_map.append(('id', None))
+                columns.append((disp, "ID (row key for update)", "key")); continue
+            if s in attr_by_safe:
+                if s in seen: duplicates.append(disp)
+                seen.add(s); mapped_attr_safes.add(s)
+                col_map.append(('attr', attr_by_safe[s]))
+                columns.append((disp, "Attribute", "ok")); continue
+            if s in rel_by_safe:
+                if s in seen: duplicates.append(disp)
+                seen.add(s)
+                col_map.append(('rel', rel_by_safe[s]))
+                columns.append((disp, "Relationship", "ok")); continue
+            if s in look_safe:
+                col_map.append(('look', None))
+                columns.append((disp, "Look-through (computed, ignored)", "ignore")); continue
+            col_map.append(('unknown', None))
+            columns.append((disp, "Unrecognized (ignored)", "ignore"))
+
+        data_count = sum(1 for r in all_rows[1:] if any(c is not None and str(c).strip() != "" for c in r))
+        missing_required = [a['name'] for a in attrs if a['required'] and a['safe'] not in mapped_attr_safes]
+        has_recognized = any(k in ('attr', 'rel') for k, _ in col_map)
+
+        problems = []
+        if duplicates:
+            problems.append("Duplicate columns map to the same field: " + ", ".join(duplicates))
+        if missing_required:
+            problems.append("Required columns are missing: " + ", ".join(missing_required))
+        if data_count == 0:
+            problems.append("No data rows found.")
+        if not has_recognized:
+            problems.append("No recognized attribute or relationship columns.")
+
+        return {
+            'columns': columns, 'col_map': col_map, 'id_col_index': id_col_index,
+            'data_count': data_count, 'missing_required': missing_required,
+            'duplicates': duplicates, 'problems': problems, 'can_import': not problems,
+        }
+
+    def import_data(self):
+        if not self.current_view_name: return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Data", "",
+            "Data Files (*.xlsx *.csv);;Excel Files (*.xlsx);;CSV Files (*.csv)")
+        if not file_path: return
+
+        try:
+            all_rows = self._read_table_file(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Could not read the file:\n\n{e}")
             return
-            
+
+        if not all_rows:
+            QMessageBox.warning(self, "Import", "The file appears to be empty.")
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            attrs, rels, lookthrough_names = self._get_import_schema(conn.cursor())
+
+        analysis = self._analyze_import(all_rows, attrs, rels, lookthrough_names)
+        analysis['file'] = os.path.basename(file_path)
+
+        dlg = ImportPreviewDialog(self, analysis)
+        if not dlg.exec(): return
+
+        self._run_import(all_rows, attrs, rels, analysis)
+
+    def _run_import(self, all_rows, attrs, rels, analysis):
+        col_map = analysis['col_map']
+        id_idx = analysis['id_col_index']
+        table = self.current_table_name
+
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA foreign_keys = 1")
                 cur = conn.cursor()
-                
-                cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ?", (self.current_class_id,))
-                attributes_meta = {}
-                for attr_id, name, d_type, is_uniq, is_req in cur.fetchall():
-                    if d_type == "look-through": continue
-                    
-                    safe_name = sanitize_name(name)
-                    attributes_meta[safe_name] = {
-                        "safe_col": safe_name,
-                        "type": d_type,
-                        "unique": bool(is_uniq),
-                        "required": bool(is_req)
-                    }
-                    
-                matrix_counts = {}
-                cur.execute("""
-                    SELECT a.name, COUNT(m.id) 
-                    FROM attributes a JOIN matrix_columns m ON a.id = m.attribute_id 
-                    WHERE a.class_id = ? GROUP BY a.id
-                """, (self.current_class_id,))
-                for attr_name, col_count in cur.fetchall():
-                    matrix_counts[sanitize_name(attr_name)] = col_count
-                    
-                cur.execute("""
-                    SELECT c.name, r.rel_type, c.id 
-                    FROM relationships r JOIN classes c ON r.target_class = c.id 
-                    WHERE r.source_class = ?
-                """, (self.current_class_id,))
-                relationships_meta = {}
-                for t_name, r_type, t_class_id in cur.fetchall():
-                    safe_target_name = sanitize_name(t_name)
-                    relationships_meta[safe_target_name] = {
-                        "target_table": f"objects_{safe_target_name}",
-                        "junc_table": f"rel_{self.current_table_name}_to_objects_{safe_target_name}"
-                    }
 
-                existing_unique_values = {}
-                for name_safe, meta in attributes_meta.items():
-                    if meta["unique"]:
-                        cur.execute(f"SELECT {qid(meta['safe_col'])} FROM {qid(self.current_table_name)} WHERE {qid(meta['safe_col'])} IS NOT NULL")
-                        existing_unique_values[meta["safe_col"]] = set(row[0] for row in cur.fetchall())
+                # --- snapshots for validation ---
+                cur.execute(f"SELECT id FROM {qid(table)}")
+                existing_ids = {r[0] for r in cur.fetchall()}
 
-                wb = openpyxl.load_workbook(file_path, data_only=True)
-                ws = wb.active
-                
-                all_rows = list(ws.iter_rows(values_only=True))
-                if len(all_rows) < 2: raise ValueError("Excel file must contain at least a header row and one data row.")
-                    
-                headers = [sanitize_name(str(h)) if h else "" for h in all_rows[0]]
-                
-                for name_safe, meta in attributes_meta.items():
-                    if meta["required"] and name_safe not in headers:
-                        raise ValueError(f"CRITICAL: The required attribute '{meta['safe_col']}' is completely missing from the Excel headers!")
+                uniq_maps = {}  # safe_col -> {value: owner_id}
+                for a in attrs:
+                    if a['unique']:
+                        cur.execute(f"SELECT {qid(a['safe'])}, id FROM {qid(table)} WHERE {qid(a['safe'])} IS NOT NULL")
+                        uniq_maps[a['safe']] = {v: i for v, i in cur.fetchall()}
 
-                in_file_unique_tracker = {meta["safe_col"]: set() for meta in attributes_meta.values() if meta["unique"]}
-                validated_inserts = []
-                validated_relationships = []
+                rel_data = {}  # safe -> {'ids': set, 'title_map': {lower: [ids]} or None, 'junc': str, 'name': str}
+                for r in rels:
+                    cur.execute(f"SELECT id FROM {qid(r['target_table'])}")
+                    tids = {x[0] for x in cur.fetchall()}
+                    title_map = None
+                    if len(r['title_cols']) == 1:
+                        title_map = {}
+                        try:
+                            cur.execute(f"SELECT [ID], {qid(r['title_cols'][0])} FROM {qid(r['base_view'])}")
+                            for tid, tval in cur.fetchall():
+                                if tval is not None and str(tval).strip() != "":
+                                    title_map.setdefault(str(tval).strip().lower(), []).append(tid)
+                        except sqlite3.OperationalError:
+                            title_map = None
+                    rel_data[r['safe']] = {'ids': tids, 'title_map': title_map,
+                                           'junc': r['junc_table'], 'name': r['name']}
 
-                for row_number, row_data in enumerate(all_rows[1:], start=2): 
-                    if all(cell is None or str(cell).strip() == "" for cell in row_data): continue 
+                # --- validate every row first (nothing written yet) ---
+                file_unique_used = {}  # (safe, value) -> row_number
+                seen_ids = set()
+                ops = []
 
-                    insert_cols = []
-                    insert_vals = []
-                    pending_rels = {} 
-                    
-                    for col_idx, cell_value in enumerate(row_data):
-                        if col_idx >= len(headers): break
-                        header = headers[col_idx]
-                        if not header: continue
-                        
-                        if isinstance(cell_value, datetime.datetime): val = cell_value.strftime("%Y-%m-%d %H:%M:%S")
-                        else: val = None if (cell_value is None or str(cell_value).strip() == "") else str(cell_value).strip()
-                        
-                        is_empty = (val is None)
+                for rn, row in enumerate(all_rows[1:], start=2):
+                    if not any(c is not None and str(c).strip() != "" for c in row):
+                        continue
 
-                        if header in attributes_meta:
-                            meta = attributes_meta[header]
-                            safe_col = meta["safe_col"]
-                            
-                            if is_empty:
-                                if meta["required"]: raise ValueError(f"Row {row_number}: '{header}' is Required but cell is empty.")
+                    mode, target_id = 'insert', None
+                    if id_idx is not None and id_idx < len(row):
+                        idraw = row[id_idx]
+                        if idraw is not None and str(idraw).strip() != "":
+                            try:
+                                target_id = int(float(str(idraw).strip()))
+                            except (ValueError, TypeError):
+                                raise ValueError(f"Row {rn}: invalid ID '{idraw}'.")
+                            if target_id in seen_ids:
+                                raise ValueError(f"Row {rn}: ID {target_id} appears more than once in the file.")
+                            seen_ids.add(target_id)
+                            if target_id in existing_ids:
+                                mode = 'update'
+                            else:
+                                mode, target_id = 'insert', None  # unknown ID -> add as new
+
+                    set_cols, set_vals, rels_in_row = [], [], {}
+
+                    for idx, (kind, obj) in enumerate(col_map):
+                        if idx >= len(row):
+                            break
+                        if kind == 'attr':
+                            a = obj
+                            val = self._cell_to_value(row[idx])
+                            if val is None:
+                                if a['required']:
+                                    raise ValueError(f"Row {rn}: '{a['name']}' is required but empty.")
                                 val_final = None
                             else:
-                                success, val_final = safe_convert(val, meta["type"])
-                                if not success: 
-                                    raise ValueError(f"Row {row_number}: Invalid data formatting in '{header}'. Cannot convert '{val}'.")
-                                    
-                            if meta["unique"] and val_final is not None:
-                                if val_final in existing_unique_values[safe_col]:
-                                    raise ValueError(f"Row {row_number}: '{header}' is Unique. The value '{val_final}' already exists in the database.")
-                                if val_final in in_file_unique_tracker[safe_col]:
-                                    raise ValueError(f"Row {row_number}: '{header}' is Unique. The value '{val_final}' is duplicated inside the Excel file.")
-                                in_file_unique_tracker[safe_col].add(val_final)
+                                ok, val_final = safe_convert(val, a['type'])
+                                if not ok:
+                                    raise ValueError(f"Row {rn}: cannot convert '{val}' for '{a['name']}' ({a['type']}).")
+                                if a['type'] == 'matrix' and a['matrix_count']:
+                                    try:
+                                        parsed = ast.literal_eval(val_final)
+                                    except (ValueError, SyntaxError):
+                                        parsed = None
+                                    if not isinstance(parsed, list) or len(parsed) != a['matrix_count']:
+                                        raise ValueError(f"Row {rn}: '{a['name']}' must be a list of exactly {a['matrix_count']} column list(s).")
+                                if a['unique'] and val_final is not None:
+                                    owner = uniq_maps.get(a['safe'], {}).get(val_final)
+                                    if owner is not None and owner != target_id:
+                                        raise ValueError(f"Row {rn}: '{a['name']}' value '{val_final}' already exists in the database.")
+                                    key = (a['safe'], val_final)
+                                    if key in file_unique_used:
+                                        raise ValueError(f"Row {rn}: '{a['name']}' value '{val_final}' is duplicated in the file (also row {file_unique_used[key]}).")
+                                    file_unique_used[key] = rn
+                            set_cols.append(a['safe'])
+                            set_vals.append(val_final)
 
-                            insert_cols.append(qid(safe_col))
-                            insert_vals.append(val_final)
+                        elif kind == 'rel':
+                            r = obj
+                            val = self._cell_to_value(row[idx])
+                            rd = rel_data[r['safe']]
+                            tids = []
+                            if val is not None:
+                                for tok in val.split(','):
+                                    tok = tok.strip()
+                                    if tok == "":
+                                        continue
+                                    if re.match(r'^-?\d+$', tok):
+                                        tid = int(tok)
+                                        if tid not in rd['ids']:
+                                            raise ValueError(f"Row {rn}: '{r['name']}' target ID {tid} does not exist.")
+                                    elif rd['title_map'] is not None:
+                                        matches = rd['title_map'].get(tok.lower())
+                                        if not matches:
+                                            raise ValueError(f"Row {rn}: '{r['name']}' has no object titled '{tok}'.")
+                                        if len(matches) > 1:
+                                            raise ValueError(f"Row {rn}: '{r['name']}' title '{tok}' is ambiguous ({len(matches)} matches); use a numeric ID.")
+                                        tid = matches[0]
+                                    else:
+                                        raise ValueError(f"Row {rn}: '{r['name']}' must use numeric IDs (target has no single title column).")
+                                    tids.append(tid)
+                            rels_in_row[r['safe']] = tids  # column present -> replace links
 
-                        elif header in relationships_meta:
-                            if not is_empty:
-                                rel_meta = relationships_meta[header]
-                                try: target_ids = [int(x.strip()) for x in val.split(",")]
-                                except ValueError: raise ValueError(f"Row {row_number}: Relationship '{header}' must be comma-separated numeric IDs.")
-                                    
-                                for tid in target_ids:
-                                    cur.execute(f"SELECT id FROM {qid(rel_meta['target_table'])} WHERE id = ?", (tid,))
-                                    if not cur.fetchone():
-                                        raise ValueError(f"Row {row_number}: Invalid Target ID '{tid}' for relationship '{header}'. Object doesn't exist.")
-                                
-                                pending_rels[rel_meta["junc_table"]] = target_ids
+                    ops.append({'mode': mode, 'id': target_id, 'cols': set_cols, 'vals': set_vals, 'rels': rels_in_row})
 
-                    validated_inserts.append((insert_cols, insert_vals))
-                    validated_relationships.append(pending_rels)
-
-                # Process verified inserts directly
+                # --- apply atomically ---
+                inserted = updated = 0
                 conn.execute("BEGIN IMMEDIATE")
-                records_imported = 0
-                for i, (cols, vals) in enumerate(validated_inserts):
-                    if not cols:
-                        cur.execute(f"INSERT INTO {qid(self.current_table_name)} DEFAULT VALUES")
+                for op in ops:
+                    if op['mode'] == 'update':
+                        oid = op['id']
+                        if op['cols']:
+                            set_clause = ", ".join(f"{qid(c)} = ?" for c in op['cols'])
+                            cur.execute(f"UPDATE {qid(table)} SET {set_clause} WHERE id = ?", op['vals'] + [oid])
+                        updated += 1
                     else:
-                        placeholders = ", ".join(["?"] * len(cols))
-                        query = f"INSERT INTO {qid(self.current_table_name)} ({', '.join(cols)}) VALUES ({placeholders})"
-                        cur.execute(query, vals)
-                        
-                    new_obj_id = cur.lastrowid
-                    records_imported += 1
-                    
-                    rels_to_insert = validated_relationships[i]
-                    for junc_table, target_ids in rels_to_insert.items():
-                        for tid in target_ids: cur.execute(f"INSERT INTO {qid(junc_table)} (source_id, target_id) VALUES (?, ?)", (new_obj_id, tid))
-                
+                        if op['cols']:
+                            ph = ", ".join(["?"] * len(op['cols']))
+                            cur.execute(f"INSERT INTO {qid(table)} ({', '.join(qid(c) for c in op['cols'])}) VALUES ({ph})", op['vals'])
+                        else:
+                            cur.execute(f"INSERT INTO {qid(table)} DEFAULT VALUES")
+                        oid = cur.lastrowid
+                        inserted += 1
+
+                    for rsafe, tids in op['rels'].items():
+                        junc = rel_data[rsafe]['junc']
+                        cur.execute(f"DELETE FROM {qid(junc)} WHERE source_id = ?", (oid,))
+                        for tid in tids:
+                            cur.execute(f"INSERT INTO {qid(junc)} (source_id, target_id) VALUES (?, ?)", (oid, tid))
+
                 conn.commit()
-                self.build_and_exec_query() 
-                QMessageBox.information(self, "Import Successful", f"Successfully imported {records_imported} object(s)!")
-            
+
+            self.build_and_exec_query()
+            QMessageBox.information(self, "Import Complete",
+                f"Added {inserted} and updated {updated} object(s).")
         except Exception as e:
-            QMessageBox.critical(self, "Import Failed", f"Import aborted. No changes were made to the database.\n\nReason:\n{str(e)}")
+            QMessageBox.critical(self, "Import Failed",
+                f"Import aborted. No changes were made to the database.\n\nReason:\n{e}")
 
 
 class MainWindow(QWidget):
@@ -1649,14 +2172,25 @@ class MainWindow(QWidget):
             db_path = os.path.join(os.path.expanduser("~"), "nexus_default.db")
             settings.setValue("db_path", db_path)
             
-        if not os.path.exists(db_path): init_db(db_path)
+        if not os.path.exists(db_path):
+            init_db(db_path)
+        else:
+            # Ensure WAL is enabled even for databases created before this was added.
+            # WAL is a persistent property of the file, so this one-time switch sticks.
+            try:
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.Error:
+                pass
 
         if QSqlDatabase.contains(): db = QSqlDatabase.database()
         else: db = QSqlDatabase.addDatabase("QSQLITE")
-        
+
         db.setDatabaseName(db_path)
         if not db.open(): return
 
+        # Drop any read lock the data view holds before sync_all_classes runs DDL.
+        self.data_browser.query_model.clear()
         self.sync_all_classes(db_path)
 
         try:

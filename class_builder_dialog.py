@@ -33,6 +33,10 @@ def qid(name):
 
 def init_db(db_path=DB_NAME):
     with sqlite3.connect(db_path) as conn:
+        # WAL lets readers (the Qt table view) and the writer (sqlite3 DDL/DML)
+        # work on the same file concurrently without "database is locked" errors.
+        # This is a persistent property of the file, so setting it once is enough.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = 1")
         cursor = conn.cursor()
         cursor.executescript("""
@@ -446,6 +450,13 @@ class ClassBuilderDialog(QDialog):
             cur = conn.cursor()
             cur.execute("SELECT name, path FROM classes WHERE id = ?", (self.current_class_id,))
             row = cur.fetchone()
+            if not row:
+                # Class was deleted out from under us (e.g. removed in another window).
+                QMessageBox.warning(self, "Class Not Found", "This class no longer exists in the database.")
+                self.current_class_id = None
+                self.editor_widget.setEnabled(False)
+                self.refresh_class_list()
+                return
             self.class_name_input.setText(row[0])
             self.class_path_input.setText(row[1] if row[1] else "")
             
@@ -558,9 +569,39 @@ class ClassBuilderDialog(QDialog):
                 attr_names.add(safe_name)
 
         if self.check_for_circular_dependencies(name):
-            QMessageBox.critical(self, "Circular Dependency Detected", 
+            QMessageBox.critical(self, "Circular Dependency Detected",
                 "Cannot save class: This 'Look-Through' configuration creates an infinite circular loop.")
             return
+
+        # A look-through resolves its values through a relationship's junction table, so it
+        # is only valid if this class actually has a relationship to the referenced class.
+        # Validate against the relationships currently in the editor (they save together).
+        rel_targets_safe = set()
+        for i in range(self.relationships_layout.count()):
+            widget = self.relationships_layout.itemAt(i).widget()
+            if isinstance(widget, RelationshipRow):
+                tgt = widget.target_combo.currentText().strip()
+                if tgt:
+                    rel_targets_safe.add(sanitize_name(tgt))
+
+        for i in range(self.attributes_layout.count()):
+            widget = self.attributes_layout.itemAt(i).widget()
+            if isinstance(widget, AttributeRow) and widget.type_combo.currentText() == "look-through":
+                lookup = widget.lookup_input.currentText().strip()
+                if not lookup:
+                    continue  # empty look-through renders as NULL; nothing to validate
+                parts = lookup.split('.')
+                if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                    QMessageBox.warning(self, "Invalid Look-Through",
+                        f"The look-through '{lookup}' is malformed.\n\nExpected the form 'TargetClass.Attribute'.")
+                    return
+                tgt_class_disp = parts[0].strip()
+                if sanitize_name(tgt_class_disp) not in rel_targets_safe:
+                    QMessageBox.warning(self, "Missing Relationship",
+                        f"The look-through '{lookup}' needs a relationship from this class to "
+                        f"'{tgt_class_disp}'.\n\nAdd that relationship (in the Relationships section) "
+                        f"first, or remove the look-through attribute.")
+                    return
 
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -598,14 +639,14 @@ class ClassBuilderDialog(QDialog):
                                 old_junc = f"rel_objects_{old_safe_class}_to_objects_{sanitize_name(tgt_name)}"
                                 new_junc = f"rel_{table_name}_to_objects_{sanitize_name(tgt_name)}"
                                 try: cur.execute(f"ALTER TABLE {qid(old_junc)} RENAME TO {qid(new_junc)}")
-                                except: pass
+                                except sqlite3.OperationalError: pass
 
                             cur.execute("SELECT c.name FROM relationships r JOIN classes c ON r.source_class = c.id WHERE r.target_class = ?", (self.current_class_id,))
                             for (src_name,) in cur.fetchall():
                                 old_junc = f"rel_objects_{sanitize_name(src_name)}_to_objects_{old_safe_class}"
                                 new_junc = f"rel_objects_{sanitize_name(src_name)}_to_{table_name}"
                                 try: cur.execute(f"ALTER TABLE {qid(old_junc)} RENAME TO {qid(new_junc)}")
-                                except: pass
+                                except sqlite3.OperationalError: pass
 
                         except sqlite3.OperationalError as e:
                             if "no such table" not in str(e).lower():
