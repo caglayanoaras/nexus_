@@ -26,54 +26,69 @@ def sanitize_name(name):
     if safe and safe[0].isdigit(): safe = "n_" + safe
     return safe if safe else "unnamed"
 
+def qid(name):
+    """Safely quote identifiers for SQLite."""
+    if name is None: return ""
+    return f"[{str(name).replace(']', ']]')}]"
+
 def init_db(db_path=DB_NAME):
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = 1")
-    cursor = conn.cursor()
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS classes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            path TEXT DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS attributes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            class_id INTEGER,
-            name TEXT NOT NULL,
-            data_type TEXT NOT NULL,
-            row_order INTEGER DEFAULT 0,
-            show_in_table INTEGER DEFAULT 1,
-            is_title INTEGER DEFAULT 0,
-            is_unique INTEGER DEFAULT 0,
-            is_required INTEGER DEFAULT 0,
-            lookup_query TEXT DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS matrix_columns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            attribute_id INTEGER,
-            column_name TEXT NOT NULL,
-            column_index INTEGER NOT NULL,
-            FOREIGN KEY(attribute_id) REFERENCES attributes(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS relationships (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_class INTEGER,
-            target_class INTEGER,
-            rel_type TEXT NOT NULL,
-            row_order INTEGER DEFAULT 0,
-            show_in_table INTEGER DEFAULT 1,
-            FOREIGN KEY(source_class) REFERENCES classes(id) ON DELETE CASCADE,
-            FOREIGN KEY(target_class) REFERENCES classes(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS modules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            path TEXT DEFAULT '',
-            code TEXT DEFAULT ''
-        );
-    """)
-    conn.commit()
-    return conn
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = 1")
+        cursor = conn.cursor()
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS classes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS attributes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER,
+                name TEXT NOT NULL,
+                data_type TEXT NOT NULL,
+                row_order INTEGER DEFAULT 0,
+                show_in_table INTEGER DEFAULT 1,
+                is_title INTEGER DEFAULT 0,
+                is_unique INTEGER DEFAULT 0,
+                is_required INTEGER DEFAULT 0,
+                lookup_query TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS matrix_columns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attribute_id INTEGER,
+                column_name TEXT NOT NULL,
+                column_index INTEGER NOT NULL,
+                FOREIGN KEY(attribute_id) REFERENCES attributes(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_class INTEGER,
+                target_class INTEGER,
+                rel_type TEXT NOT NULL,
+                row_order INTEGER DEFAULT 0,
+                show_in_table INTEGER DEFAULT 1,
+                show_in_base INTEGER DEFAULT 1,
+                show_in_target INTEGER DEFAULT 1,
+                FOREIGN KEY(source_class) REFERENCES classes(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_class) REFERENCES classes(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT DEFAULT '',
+                code TEXT DEFAULT ''
+            );
+        """)
+        
+        # Auto-migrate older databases to support split relationship visibility
+        try:
+            cursor.execute("SELECT show_in_base FROM relationships LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE relationships ADD COLUMN show_in_base INTEGER DEFAULT 1")
+            cursor.execute("ALTER TABLE relationships ADD COLUMN show_in_target INTEGER DEFAULT 1")
+            cursor.execute("UPDATE relationships SET show_in_base = show_in_table, show_in_target = show_in_table")
+            
+        conn.commit()
 
 class ReorderableRow(QWidget):
     def __init__(self, parent_layout):
@@ -166,10 +181,16 @@ class AttributeRow(ReorderableRow):
             self.matrix_cols = attr_data.get('matrix_cols', [])
             self.lookup_input.setCurrentText(attr_data.get('lookup_query', ''))
             self.on_type_changed(attr_data['type'])
+        else:
+            self.on_type_changed(self.type_combo.currentText())
 
     def on_type_changed(self, text):
         self.matrix_btn.setVisible(text == "matrix")
         self.lookup_input.setVisible(text == "look-through")
+        
+        is_look_through = (text == "look-through")
+        self.unique_cb.setVisible(not is_look_through)
+        self.req_cb.setVisible(not is_look_through)
 
     def set_matrix_columns(self):
         current_cols = ",".join(self.matrix_cols)
@@ -207,8 +228,11 @@ class RelationshipRow(ReorderableRow):
         self.type_combo = QComboBox()
         self.type_combo.addItems(["one_to_many", "many_to_many"])
         
-        self.show_cb = QCheckBox("Show in Table")
-        self.show_cb.setChecked(True)
+        self.show_base_cb = QCheckBox("Show in Base")
+        self.show_base_cb.setChecked(True)
+        
+        self.show_target_cb = QCheckBox("Show in Target")
+        self.show_target_cb.setChecked(True)
         
         self.delete_btn = QPushButton()
         self.delete_btn.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
@@ -220,7 +244,8 @@ class RelationshipRow(ReorderableRow):
         layout.addWidget(QLabel("Target Class:"))
         layout.addWidget(self.target_combo)
         layout.addWidget(self.type_combo)
-        layout.addWidget(self.show_cb)
+        layout.addWidget(self.show_base_cb)
+        layout.addWidget(self.show_target_cb)
         layout.addWidget(self.delete_btn)
 
         if rel_data:
@@ -228,7 +253,9 @@ class RelationshipRow(ReorderableRow):
             if idx >= 0: 
                 self.target_combo.setCurrentIndex(idx)
             self.type_combo.setCurrentText(rel_data['type'])
-            self.show_cb.setChecked(bool(rel_data.get('show_in_table', 1)))
+            self.show_base_cb.setChecked(bool(rel_data.get('show_in_base', 1)))
+            self.show_target_cb.setChecked(bool(rel_data.get('show_in_target', 1)))
+
 
 class ClassBuilderDialog(QDialog):
     def __init__(self, parent=None):
@@ -242,7 +269,8 @@ class ClassBuilderDialog(QDialog):
         if not path:
             path = DB_NAME 
             
-        self.db = init_db(path)
+        self.db_path = path
+        init_db(self.db_path)
         self.current_class_id = None
 
         main_layout = QVBoxLayout(self)
@@ -329,25 +357,27 @@ class ClassBuilderDialog(QDialog):
         self.refresh_class_list()
         
     def get_all_classes(self):
-        cur = self.db.cursor()
         try:
-            cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
-            return cur.fetchall()
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
+                return cur.fetchall()
         except sqlite3.OperationalError as e:
             if "no such table" not in str(e).lower():
                 QMessageBox.warning(self, "Database Error", f"Error loading classes: {e}")
             return []
 
     def get_all_lookups(self):
-        cur = self.db.cursor()
         try:
-            cur.execute("""
-                SELECT c.name, a.name 
-                FROM classes c 
-                JOIN attributes a ON c.id = a.class_id
-                ORDER BY c.name ASC, a.name ASC
-            """)
-            return [f"{row[0]}.{row[1]}" for row in cur.fetchall()]
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT c.name, a.name 
+                    FROM classes c 
+                    JOIN attributes a ON c.id = a.class_id
+                    ORDER BY c.name ASC, a.name ASC
+                """)
+                return [f"{row[0]}.{row[1]}" for row in cur.fetchall()]
         except sqlite3.OperationalError as e:
             if "no such table" not in str(e).lower():
                 QMessageBox.warning(self, "Database Error", f"Error loading lookups: {e}")
@@ -412,80 +442,82 @@ class ClassBuilderDialog(QDialog):
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
 
-        cur = self.db.cursor()
-        cur.execute("SELECT name, path FROM classes WHERE id = ?", (self.current_class_id,))
-        row = cur.fetchone()
-        self.class_name_input.setText(row[0])
-        self.class_path_input.setText(row[1] if row[1] else "")
-        
-        valid_lookups = self.get_all_lookups()
-
-        cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
-        attributes = cur.fetchall()
-        for attr_id, attr_name, attr_type, show_in_table, is_title, is_unique, is_required, lookup_query in attributes:
-            matrix_cols = []
-            if attr_type == "matrix":
-                cur.execute("SELECT column_name FROM matrix_columns WHERE attribute_id = ? ORDER BY column_index", (attr_id,))
-                matrix_cols = [row[0] for row in cur.fetchall()]
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name, path FROM classes WHERE id = ?", (self.current_class_id,))
+            row = cur.fetchone()
+            self.class_name_input.setText(row[0])
+            self.class_path_input.setText(row[1] if row[1] else "")
             
-            attr_data = {
-                'id': attr_id,
-                'name': attr_name, 
-                'type': attr_type, 
-                'matrix_cols': matrix_cols,
-                'show_in_table': show_in_table,
-                'is_title': is_title,
-                'is_unique': is_unique,
-                'is_required': is_required,
-                'lookup_query': lookup_query if lookup_query else ''
-            }
-            self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data))
+            valid_lookups = self.get_all_lookups()
 
-        cur.execute("SELECT id, target_class, rel_type, show_in_table FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
-        for rel_id, target, rel_type, show_in_table in cur.fetchall():
-            valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
-            self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_table': show_in_table}))
+            cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
+            attributes = cur.fetchall()
+            for attr_id, attr_name, attr_type, show_in_table, is_title, is_unique, is_required, lookup_query in attributes:
+                matrix_cols = []
+                if attr_type == "matrix":
+                    cur.execute("SELECT column_name FROM matrix_columns WHERE attribute_id = ? ORDER BY column_index", (attr_id,))
+                    matrix_cols = [row[0] for row in cur.fetchall()]
+                
+                attr_data = {
+                    'id': attr_id,
+                    'name': attr_name, 
+                    'type': attr_type, 
+                    'matrix_cols': matrix_cols,
+                    'show_in_table': show_in_table,
+                    'is_title': is_title,
+                    'is_unique': is_unique,
+                    'is_required': is_required,
+                    'lookup_query': lookup_query if lookup_query else ''
+                }
+                self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data))
+
+            cur.execute("SELECT id, target_class, rel_type, show_in_base, show_in_target FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
+            for rel_id, target, rel_type, show_in_base, show_in_target in cur.fetchall():
+                valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
+                self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_base': show_in_base, 'show_in_target': show_in_target}))
 
     def check_for_circular_dependencies(self, new_class_name):
-        cur = self.db.cursor()
-        cur.execute("SELECT id, name FROM classes")
-        classes = {row[0]: row[1] for row in cur.fetchall()}
-        
-        temp_id = self.current_class_id if self.current_class_id else -1
-        classes[temp_id] = new_class_name
-        graph = {cid: set() for cid in classes}
-        
-        cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
-        for cid, lookup in cur.fetchall():
-            if cid == self.current_class_id: continue 
-            tgt_name = lookup.split('.')[0].strip().lower()
-            for t_id, t_name in classes.items():
-                if t_name.lower() == tgt_name: graph[cid].add(t_id)
-
-        for i in range(self.attributes_layout.count()):
-            widget = self.attributes_layout.itemAt(i).widget()
-            if isinstance(widget, AttributeRow) and widget.type_combo.currentText() == "look-through":
-                lookup = widget.lookup_input.currentText().strip()
-                if lookup:
-                    tgt_name = lookup.split('.')[0].strip().lower()
-                    for t_id, t_name in classes.items():
-                        if t_name.lower() == tgt_name: graph[temp_id].add(t_id)
-
-        visited = set()
-        temp_mark = set()
-        def visit(n):
-            if n in temp_mark: return True
-            if n not in visited:
-                temp_mark.add(n)
-                for m in graph.get(n, set()):
-                    if visit(m): return True
-                temp_mark.remove(n)
-                visited.add(n)
-            return False
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM classes")
+            classes = {row[0]: row[1] for row in cur.fetchall()}
             
-        for node in graph:
-            if visit(node): return True
-        return False
+            temp_id = self.current_class_id if self.current_class_id else -1
+            classes[temp_id] = new_class_name
+            graph = {cid: set() for cid in classes}
+            
+            cur.execute("SELECT class_id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query != ''")
+            for cid, lookup in cur.fetchall():
+                if cid == self.current_class_id: continue 
+                tgt_name = lookup.split('.')[0].strip().lower()
+                for t_id, t_name in classes.items():
+                    if t_name.lower() == tgt_name: graph[cid].add(t_id)
+
+            for i in range(self.attributes_layout.count()):
+                widget = self.attributes_layout.itemAt(i).widget()
+                if isinstance(widget, AttributeRow) and widget.type_combo.currentText() == "look-through":
+                    lookup = widget.lookup_input.currentText().strip()
+                    if lookup:
+                        tgt_name = lookup.split('.')[0].strip().lower()
+                        for t_id, t_name in classes.items():
+                            if t_name.lower() == tgt_name: graph[temp_id].add(t_id)
+
+            visited = set()
+            temp_mark = set()
+            def visit(n):
+                if n in temp_mark: return True
+                if n not in visited:
+                    temp_mark.add(n)
+                    for m in graph.get(n, set()):
+                        if visit(m): return True
+                    temp_mark.remove(n)
+                    visited.add(n)
+                return False
+                
+            for node in graph:
+                if visit(node): return True
+            return False
 
     def save_class(self):
         name = self.class_name_input.text().strip()
@@ -495,16 +527,17 @@ class ClassBuilderDialog(QDialog):
             return
 
         safe_class_name = sanitize_name(name)
-        cur = self.db.cursor()
-
-        try:
-            cur.execute("SELECT id, name FROM classes")
-            for r_id, r_name in cur.fetchall():
-                if r_id != self.current_class_id and sanitize_name(r_name) == safe_class_name:
-                    QMessageBox.warning(self, "Error", f"Class name '{name}' collides with existing class '{r_name}'.")
-                    return
-        except sqlite3.OperationalError:
-            pass 
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT id, name FROM classes")
+                for r_id, r_name in cur.fetchall():
+                    if r_id != self.current_class_id and sanitize_name(r_name) == safe_class_name:
+                        QMessageBox.warning(self, "Error", f"Class name '{name}' collides with existing class '{r_name}'.")
+                        return
+            except sqlite3.OperationalError:
+                pass 
 
         attr_names = set()
         for i in range(self.attributes_layout.count()):
@@ -530,148 +563,171 @@ class ClassBuilderDialog(QDialog):
             return
 
         try:
-            if self.current_class_id is None:
-                cur.execute("INSERT INTO classes (name, path) VALUES (?, ?)", (name, path_val))
-                self.current_class_id = cur.lastrowid
-                table_name = f"objects_{safe_class_name}"
-            else:
-                cur.execute("SELECT name FROM classes WHERE id = ?", (self.current_class_id,))
-                old_class_name = cur.fetchone()[0]
-                cur.execute("UPDATE classes SET name = ?, path = ? WHERE id = ?", (name, path_val, self.current_class_id))
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA foreign_keys = 1")
+                cur = conn.cursor()
                 
-                # --- CASCADING CLASS RENAME FOR LOOK-THROUGHS ---
-                if old_class_name != name:
-                    cur.execute("SELECT id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query LIKE ?", (f"{old_class_name}.%",))
-                    for a_id, l_query in cur.fetchall():
-                        parts = l_query.split('.')
-                        if len(parts) == 2 and parts[0] == old_class_name:
-                            new_query = f"{name}.{parts[1]}"
-                            cur.execute("UPDATE attributes SET lookup_query = ? WHERE id = ?", (new_query, a_id))
+                conn.execute("BEGIN IMMEDIATE")
                 
-                old_safe_class = sanitize_name(old_class_name)
-                table_name = f"objects_{safe_class_name}"
-                
-                if old_safe_class != safe_class_name:
-                    try:
-                        cur.execute(f"ALTER TABLE objects_{old_safe_class} RENAME TO {table_name}")
-                    except sqlite3.OperationalError as e:
-                        if "no such table" not in str(e).lower():
-                            QMessageBox.warning(self, "Database Warning", f"Could not rename physical table: {e}")
-
-            # Process Attributes Differentially to prevent Data Loss
-            cur.execute("SELECT id, name FROM attributes WHERE class_id = ?", (self.current_class_id,))
-            old_attrs = {row[0]: row[1] for row in cur.fetchall()}
-            processed_attrs = []
-
-            for i in range(self.attributes_layout.count()):
-                widget = self.attributes_layout.itemAt(i).widget()
-                if isinstance(widget, AttributeRow):
-                    attr_name = widget.name_input.text().strip()
-                    attr_type = widget.type_combo.currentText()
-                    if not attr_name: continue
+                if self.current_class_id is None:
+                    cur.execute("INSERT INTO classes (name, path) VALUES (?, ?)", (name, path_val))
+                    self.current_class_id = cur.lastrowid
+                    table_name = f"objects_{safe_class_name}"
+                else:
+                    cur.execute("SELECT name FROM classes WHERE id = ?", (self.current_class_id,))
+                    old_class_name = cur.fetchone()[0]
+                    cur.execute("UPDATE classes SET name = ?, path = ? WHERE id = ?", (name, path_val, self.current_class_id))
                     
-                    show_in_table = 1 if widget.show_cb.isChecked() else 0
-                    is_title = 1 if widget.title_cb.isChecked() else 0
-                    is_unique = 1 if widget.unique_cb.isChecked() else 0
-                    is_required = 1 if widget.req_cb.isChecked() else 0
-                    lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
+                    if old_class_name != name:
+                        cur.execute("SELECT id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query LIKE ?", (f"{old_class_name}.%",))
+                        for a_id, l_query in cur.fetchall():
+                            parts = l_query.split('.')
+                            if len(parts) == 2 and parts[0] == old_class_name:
+                                new_query = f"{name}.{parts[1]}"
+                                cur.execute("UPDATE attributes SET lookup_query = ? WHERE id = ?", (new_query, a_id))
                     
-                    if widget.attr_id and widget.attr_id in old_attrs:
-                        old_attr_name = old_attrs[widget.attr_id]
-                        old_safe_attr = sanitize_name(old_attr_name)
-                        new_safe_attr = sanitize_name(attr_name)
-                        
-                        # Handle Physical Column Renames
-                        if old_safe_attr != new_safe_attr:
-                            try:
-                                cur.execute(f"ALTER TABLE {table_name} RENAME COLUMN [{old_safe_attr}] TO [{new_safe_attr}]")
-                            except sqlite3.OperationalError as e:
-                                if "no such column" not in str(e).lower() and "no such table" not in str(e).lower():
-                                    QMessageBox.warning(self, "Database Warning", f"Could not rename physical column '{old_attr_name}': {e}")
-                                    
-                        # --- CASCADING ATTRIBUTE RENAME FOR LOOK-THROUGHS ---
-                        if old_attr_name != attr_name:
-                            old_lookup = f"{name}.{old_attr_name}" 
-                            new_lookup = f"{name}.{attr_name}"
-                            cur.execute("UPDATE attributes SET lookup_query = ? WHERE data_type = 'look-through' AND lookup_query = ?", (new_lookup, old_lookup))
+                    old_safe_class = sanitize_name(old_class_name)
+                    table_name = f"objects_{safe_class_name}"
+                    
+                    if old_safe_class != safe_class_name:
+                        try:
+                            cur.execute(f"ALTER TABLE {qid('objects_' + old_safe_class)} RENAME TO {qid(table_name)}")
                             
-                        cur.execute("""
-                            UPDATE attributes 
-                            SET name=?, data_type=?, row_order=?, show_in_table=?, is_title=?, is_unique=?, is_required=?, lookup_query=? 
-                            WHERE id=?
-                        """, (attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query, widget.attr_id))
-                        attr_id = widget.attr_id
-                    else:
-                        cur.execute("""
-                            INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required, lookup_query) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query))
-                        attr_id = cur.lastrowid
-                        widget.attr_id = attr_id
-                    
-                    processed_attrs.append(attr_id)
-                    cur.execute("DELETE FROM matrix_columns WHERE attribute_id = ?", (attr_id,))
-                    
-                    if attr_type == "matrix":
-                        for idx, col_name in enumerate(widget.matrix_cols):
-                            cur.execute("INSERT INTO matrix_columns (attribute_id, column_name, column_index) VALUES (?, ?, ?)",
-                                        (attr_id, col_name, idx))
+                            cur.execute("SELECT c.name FROM relationships r JOIN classes c ON r.target_class = c.id WHERE r.source_class = ?", (self.current_class_id,))
+                            for (tgt_name,) in cur.fetchall():
+                                old_junc = f"rel_objects_{old_safe_class}_to_objects_{sanitize_name(tgt_name)}"
+                                new_junc = f"rel_{table_name}_to_objects_{sanitize_name(tgt_name)}"
+                                try: cur.execute(f"ALTER TABLE {qid(old_junc)} RENAME TO {qid(new_junc)}")
+                                except: pass
 
-            for d_id in set(old_attrs.keys()) - set(processed_attrs):
-                cur.execute("DELETE FROM attributes WHERE id = ?", (d_id,))
+                            cur.execute("SELECT c.name FROM relationships r JOIN classes c ON r.source_class = c.id WHERE r.target_class = ?", (self.current_class_id,))
+                            for (src_name,) in cur.fetchall():
+                                old_junc = f"rel_objects_{sanitize_name(src_name)}_to_objects_{old_safe_class}"
+                                new_junc = f"rel_objects_{sanitize_name(src_name)}_to_{table_name}"
+                                try: cur.execute(f"ALTER TABLE {qid(old_junc)} RENAME TO {qid(new_junc)}")
+                                except: pass
 
-            # Process Relationships Differentially
-            cur.execute("SELECT id FROM relationships WHERE source_class = ?", (self.current_class_id,))
-            old_rels = {row[0] for row in cur.fetchall()}
-            processed_rels = []
+                        except sqlite3.OperationalError as e:
+                            if "no such table" not in str(e).lower():
+                                QMessageBox.warning(self, "Database Warning", f"Could not rename physical table/junctions: {e}")
 
-            for i in range(self.relationships_layout.count()):
-                widget = self.relationships_layout.itemAt(i).widget()
-                if isinstance(widget, RelationshipRow):
-                    target_id = widget.target_combo.currentData()
-                    rel_type = widget.type_combo.currentText()
-                    show_in_table = 1 if widget.show_cb.isChecked() else 0
-                    
-                    if target_id is not None:
-                        if widget.rel_id and widget.rel_id in old_rels:
+                cur.execute("SELECT id, name FROM attributes WHERE class_id = ?", (self.current_class_id,))
+                old_attrs = {row[0]: row[1] for row in cur.fetchall()}
+                processed_attrs = []
+
+                for i in range(self.attributes_layout.count()):
+                    widget = self.attributes_layout.itemAt(i).widget()
+                    if isinstance(widget, AttributeRow):
+                        attr_name = widget.name_input.text().strip()
+                        attr_type = widget.type_combo.currentText()
+                        if not attr_name: continue
+                        
+                        show_in_table = 1 if widget.show_cb.isChecked() else 0
+                        is_title = 1 if widget.title_cb.isChecked() else 0
+                        # Explicitly save Unique/Req as 0 if look-through
+                        is_unique = 1 if widget.unique_cb.isChecked() and attr_type != "look-through" else 0
+                        is_required = 1 if widget.req_cb.isChecked() and attr_type != "look-through" else 0
+                        lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
+                        
+                        if widget.attr_id and widget.attr_id in old_attrs:
+                            old_attr_name = old_attrs[widget.attr_id]
+                            old_safe_attr = sanitize_name(old_attr_name)
+                            new_safe_attr = sanitize_name(attr_name)
+                            
+                            if old_safe_attr != new_safe_attr:
+                                try:
+                                    cur.execute(f"ALTER TABLE {qid(table_name)} RENAME COLUMN {qid(old_safe_attr)} TO {qid(new_safe_attr)}")
+                                except sqlite3.OperationalError as e:
+                                    if "no such column" not in str(e).lower() and "no such table" not in str(e).lower():
+                                        QMessageBox.warning(self, "Database Warning", f"Could not rename physical column '{old_attr_name}': {e}")
+                                        
+                            if old_attr_name != attr_name:
+                                old_lookup = f"{name}.{old_attr_name}" 
+                                new_lookup = f"{name}.{attr_name}"
+                                cur.execute("UPDATE attributes SET lookup_query = ? WHERE data_type = 'look-through' AND lookup_query = ?", (new_lookup, old_lookup))
+                                
                             cur.execute("""
-                                UPDATE relationships 
-                                SET target_class=?, rel_type=?, row_order=?, show_in_table=? 
+                                UPDATE attributes 
+                                SET name=?, data_type=?, row_order=?, show_in_table=?, is_title=?, is_unique=?, is_required=?, lookup_query=? 
                                 WHERE id=?
-                            """, (target_id, rel_type, i, show_in_table, widget.rel_id))
-                            processed_rels.append(widget.rel_id)
+                            """, (attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query, widget.attr_id))
+                            attr_id = widget.attr_id
                         else:
                             cur.execute("""
-                                INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_table) 
-                                VALUES (?, ?, ?, ?, ?)
-                            """, (self.current_class_id, target_id, rel_type, i, show_in_table))
-                            widget.rel_id = cur.lastrowid
-                            processed_rels.append(widget.rel_id)
+                                INSERT INTO attributes (class_id, name, data_type, row_order, show_in_table, is_title, is_unique, is_required, lookup_query) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (self.current_class_id, attr_name, attr_type, i, show_in_table, is_title, is_unique, is_required, lookup_query))
+                            attr_id = cur.lastrowid
+                            widget.attr_id = attr_id
+                        
+                        processed_attrs.append(attr_id)
+                        cur.execute("DELETE FROM matrix_columns WHERE attribute_id = ?", (attr_id,))
+                        
+                        if attr_type == "matrix":
+                            for idx, col_name in enumerate(widget.matrix_cols):
+                                cur.execute("INSERT INTO matrix_columns (attribute_id, column_name, column_index) VALUES (?, ?, ?)",
+                                            (attr_id, col_name, idx))
 
-            for d_id in old_rels - set(processed_rels):
-                cur.execute("DELETE FROM relationships WHERE id = ?", (d_id,))
+                for d_id in set(old_attrs.keys()) - set(processed_attrs):
+                    cur.execute("DELETE FROM attributes WHERE id = ?", (d_id,))
 
-            self.db.commit()
-            self.refresh_class_list()
-            QMessageBox.information(self, "Success", "Class saved successfully!")
+                cur.execute("SELECT id FROM relationships WHERE source_class = ?", (self.current_class_id,))
+                old_rels = {row[0] for row in cur.fetchall()}
+                processed_rels = []
+
+                for i in range(self.relationships_layout.count()):
+                    widget = self.relationships_layout.itemAt(i).widget()
+                    if isinstance(widget, RelationshipRow):
+                        target_id = widget.target_combo.currentData()
+                        rel_type = widget.type_combo.currentText()
+                        show_in_base = 1 if widget.show_base_cb.isChecked() else 0
+                        show_in_target = 1 if widget.show_target_cb.isChecked() else 0
+                        
+                        if target_id is not None:
+                            if widget.rel_id and widget.rel_id in old_rels:
+                                cur.execute("""
+                                    UPDATE relationships 
+                                    SET target_class=?, rel_type=?, row_order=?, show_in_base=?, show_in_target=? 
+                                    WHERE id=?
+                                """, (target_id, rel_type, i, show_in_base, show_in_target, widget.rel_id))
+                                processed_rels.append(widget.rel_id)
+                            else:
+                                cur.execute("""
+                                    INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_base, show_in_target) 
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                """, (self.current_class_id, target_id, rel_type, i, show_in_base, show_in_target))
+                                widget.rel_id = cur.lastrowid
+                                processed_rels.append(widget.rel_id)
+
+                for d_id in old_rels - set(processed_rels):
+                    cur.execute("DELETE FROM relationships WHERE id = ?", (d_id,))
+
+                conn.commit()
+                self.refresh_class_list()
+                QMessageBox.information(self, "Success", "Class saved successfully!")
             
         except sqlite3.IntegrityError:
-            self.db.rollback()
             QMessageBox.warning(self, "Error", "Class name already exists.")
         except Exception as e:
-            self.db.rollback()
             QMessageBox.critical(self, "Database Error", str(e))
 
     def delete_class(self):
         if self.current_class_id is None: return
         reply = QMessageBox.question(self, "Delete", "Are you sure you want to delete this class?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            self.db.execute("DELETE FROM classes WHERE id = ?", (self.current_class_id,))
-            self.db.commit()
-            self.current_class_id = None
-            self.editor_widget.setEnabled(False)
-            self.clear_layout(self.attributes_layout)
-            self.clear_layout(self.relationships_layout)
-            self.class_name_input.clear()
-            self.class_path_input.clear()
-            self.refresh_class_list()
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute("PRAGMA foreign_keys = 1")
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("DELETE FROM classes WHERE id = ?", (self.current_class_id,))
+                    conn.commit()
+                
+                self.current_class_id = None
+                self.editor_widget.setEnabled(False)
+                self.clear_layout(self.attributes_layout)
+                self.clear_layout(self.relationships_layout)
+                self.class_name_input.clear()
+                self.class_path_input.clear()
+                self.refresh_class_list()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
