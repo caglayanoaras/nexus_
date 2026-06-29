@@ -82,17 +82,20 @@ def init_db(db_path=DB_NAME):
                 path TEXT DEFAULT '',
                 code TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS discrete_types (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS discrete_options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type_id INTEGER,
+                value TEXT NOT NULL,
+                row_order INTEGER DEFAULT 0,
+                FOREIGN KEY(type_id) REFERENCES discrete_types(id) ON DELETE CASCADE
+            );
         """)
-        
-        # Auto-migrate older databases to support split relationship visibility
-        try:
-            cursor.execute("SELECT show_in_base FROM relationships LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE relationships ADD COLUMN show_in_base INTEGER DEFAULT 1")
-            cursor.execute("ALTER TABLE relationships ADD COLUMN show_in_target INTEGER DEFAULT 1")
-            cursor.execute("UPDATE relationships SET show_in_base = show_in_table, show_in_target = show_in_table")
-            
         conn.commit()
+
 
 class ReorderableRow(QWidget):
     def __init__(self, parent_layout):
@@ -112,11 +115,11 @@ class ReorderableRow(QWidget):
             self.parent_layout.insertWidget(idx + 1, self)
 
 class AttributeRow(ReorderableRow):
-    def __init__(self, parent_layout, valid_lookups=[], attr_data=None):
+    def __init__(self, parent_layout, valid_lookups=[], attr_data=None, valid_discrete_types=None):
         super().__init__(parent_layout)
         self.matrix_cols = []
         self.attr_id = attr_data.get('id') if attr_data else None
-        
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -135,18 +138,26 @@ class AttributeRow(ReorderableRow):
         
         self.type_combo = QComboBox()
         self.type_combo.addItems([
-            "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "file", "look-through"
+            "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "file", "discrete", "look-through"
         ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
-        
+
         self.lookup_input = QComboBox()
-        self.lookup_input.setEditable(True) 
+        self.lookup_input.setEditable(True)
         self.lookup_input.addItems(valid_lookups)
         self.lookup_input.setCurrentIndex(-1)
         self.lookup_input.setPlaceholderText("TargetClass.Attribute")
         self.lookup_input.setVisible(False)
         self.lookup_input.setToolTip("Select from existing attributes or type manually (TargetClass.Attribute)")
-        
+
+        # Combo of defined discrete types; shown only for the 'discrete' type. Stores the type id.
+        self.discrete_combo = QComboBox()
+        for d_id, d_name in (valid_discrete_types or []):
+            self.discrete_combo.addItem(d_name, d_id)
+        self.discrete_combo.setCurrentIndex(-1)
+        self.discrete_combo.setVisible(False)
+        self.discrete_combo.setToolTip("Choose a discrete type (define them in the Discrete Type Builder)")
+
         self.show_cb = QCheckBox("Show")
         self.show_cb.setChecked(True)
         
@@ -168,6 +179,7 @@ class AttributeRow(ReorderableRow):
         layout.addWidget(self.name_input)
         layout.addWidget(self.type_combo)
         layout.addWidget(self.lookup_input)
+        layout.addWidget(self.discrete_combo)
         layout.addWidget(self.show_cb)
         layout.addWidget(self.title_cb)
         layout.addWidget(self.unique_cb)
@@ -183,7 +195,16 @@ class AttributeRow(ReorderableRow):
             self.unique_cb.setChecked(bool(attr_data.get('is_unique', 0)))
             self.req_cb.setChecked(bool(attr_data.get('is_required', 0)))
             self.matrix_cols = attr_data.get('matrix_cols', [])
-            self.lookup_input.setCurrentText(attr_data.get('lookup_query', ''))
+            lookup_val = attr_data.get('lookup_query', '')
+            if attr_data['type'] == 'discrete':
+                try:
+                    idx = self.discrete_combo.findData(int(lookup_val))
+                    if idx >= 0:
+                        self.discrete_combo.setCurrentIndex(idx)
+                except (ValueError, TypeError):
+                    pass
+            else:
+                self.lookup_input.setCurrentText(lookup_val)
             self.on_type_changed(attr_data['type'])
         else:
             self.on_type_changed(self.type_combo.currentText())
@@ -191,11 +212,13 @@ class AttributeRow(ReorderableRow):
     def on_type_changed(self, text):
         self.matrix_btn.setVisible(text == "matrix")
         self.lookup_input.setVisible(text == "look-through")
+        self.discrete_combo.setVisible(text == "discrete")
 
         is_look_through = (text == "look-through")
         is_file = (text == "file")
-        # Files can be required and used as titles, but uniqueness is meaningless for them.
-        self.unique_cb.setVisible(not is_look_through and not is_file)
+        is_discrete = (text == "discrete")
+        # Files/discrete can be required and used as titles, but uniqueness is meaningless.
+        self.unique_cb.setVisible(not is_look_through and not is_file and not is_discrete)
         self.req_cb.setVisible(not is_look_through)
 
     def set_matrix_columns(self):
@@ -261,6 +284,294 @@ class RelationshipRow(ReorderableRow):
             self.type_combo.setCurrentText(rel_data['type'])
             self.show_base_cb.setChecked(bool(rel_data.get('show_in_base', 1)))
             self.show_target_cb.setChecked(bool(rel_data.get('show_in_target', 1)))
+
+
+class DiscreteOptionRow(ReorderableRow):
+    def __init__(self, parent_layout, option_data=None):
+        super().__init__(parent_layout)
+        self.option_id = option_data.get('id') if option_data else None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.btn_up = QPushButton()
+        self.btn_up.setIcon(qta.icon('fa5s.arrow-up', color='gray'))
+        self.btn_up.setFixedWidth(30)
+        self.btn_up.clicked.connect(self.move_up)
+
+        self.btn_down = QPushButton()
+        self.btn_down.setIcon(qta.icon('fa5s.arrow-down', color='gray'))
+        self.btn_down.setFixedWidth(30)
+        self.btn_down.clicked.connect(self.move_down)
+
+        self.value_input = QLineEdit()
+        self.value_input.setPlaceholderText("Option value")
+
+        self.delete_btn = QPushButton()
+        self.delete_btn.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
+        self.delete_btn.setFixedWidth(30)
+        self.delete_btn.clicked.connect(self.deleteLater)
+
+        layout.addWidget(self.btn_up)
+        layout.addWidget(self.btn_down)
+        layout.addWidget(self.value_input)
+        layout.addWidget(self.delete_btn)
+
+        if option_data:
+            self.value_input.setText(option_data.get('value', ''))
+
+
+class DiscreteTypeBuilderDialog(QDialog):
+    """Define reusable option sets ("discrete types") that attributes can reference."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nexus - Discrete Type Builder")
+        self.setWindowIcon(get_app_icon())
+        self.resize(820, 560)
+
+        settings = QSettings("MyCompany", "DatabaseManagerApp")
+        path = settings.value("db_path", "").strip() or DB_NAME
+        self.db_path = path
+        init_db(self.db_path)
+        self.current_type_id = None
+
+        main_layout = QVBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        self.type_list = QListWidget()
+        self.type_list.itemClicked.connect(self.load_type)
+        btn_add = QPushButton(" Create New Type")
+        btn_add.setIcon(qta.icon('fa5s.plus-circle'))
+        btn_add.clicked.connect(self.create_new_type)
+        left_layout.addWidget(QLabel("<b>Discrete Types</b>"))
+        left_layout.addWidget(self.type_list)
+        left_layout.addWidget(btn_add)
+
+        self.editor_widget = QWidget()
+        self.editor_layout = QVBoxLayout(self.editor_widget)
+        self.editor_widget.setEnabled(False)
+
+        name_layout = QHBoxLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. Status")
+        name_layout.addWidget(QLabel("Type Name:"))
+        name_layout.addWidget(self.name_input)
+        self.editor_layout.addLayout(name_layout)
+
+        self.editor_layout.addWidget(QLabel("<b>Options</b>"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        # Only DiscreteOptionRow widgets live here, so reordering and clearing stay simple.
+        self.options_layout = QVBoxLayout(content)
+        self.options_layout.setAlignment(Qt.AlignTop)
+        scroll.setWidget(content)
+        self.editor_layout.addWidget(scroll)
+
+        btn_opt = QPushButton(" Add Option")
+        btn_opt.setIcon(qta.icon('fa5s.plus'))
+        btn_opt.clicked.connect(lambda: self.options_layout.addWidget(DiscreteOptionRow(self.options_layout)))
+        self.editor_layout.addWidget(btn_opt)
+
+        action_layout = QHBoxLayout()
+        btn_save = QPushButton(" Save Type")
+        btn_save.setIcon(qta.icon('fa5s.save'))
+        btn_save.clicked.connect(self.save_type)
+        btn_delete = QPushButton(" Delete Type")
+        btn_delete.setIcon(qta.icon('fa5s.trash-alt', color='white'))
+        btn_delete.setStyleSheet("background-color: #ff4c4c; color: white;")
+        btn_delete.clicked.connect(self.delete_type)
+        action_layout.addWidget(btn_save)
+        action_layout.addWidget(btn_delete)
+        self.editor_layout.addLayout(action_layout)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(self.editor_widget)
+        splitter.setSizes([220, 600])
+
+        self.refresh_type_list()
+
+    def refresh_type_list(self):
+        self.type_list.clear()
+        with sqlite3.connect(self.db_path) as conn:
+            for tid, tname in conn.execute("SELECT id, name FROM discrete_types ORDER BY name ASC").fetchall():
+                item = QListWidgetItem(tname)
+                item.setIcon(qta.icon('fa5s.list-ul', color='#9C27B0'))
+                item.setData(Qt.UserRole, tid)
+                self.type_list.addItem(item)
+
+    def clear_options(self):
+        while self.options_layout.count():
+            child = self.options_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def create_new_type(self):
+        self.current_type_id = None
+        self.name_input.clear()
+        self.clear_options()
+        self.options_layout.addWidget(DiscreteOptionRow(self.options_layout))
+        self.editor_widget.setEnabled(True)
+
+    def load_type(self, item):
+        tid = item.data(Qt.UserRole)
+        if not tid:
+            return
+        self.current_type_id = tid
+        self.editor_widget.setEnabled(True)
+        self.clear_options()
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT name FROM discrete_types WHERE id = ?", (tid,)).fetchone()
+            if not row:
+                self.refresh_type_list()
+                return
+            self.name_input.setText(row[0])
+            for oid, value in conn.execute("SELECT id, value FROM discrete_options WHERE type_id = ? ORDER BY row_order", (tid,)).fetchall():
+                self.options_layout.addWidget(DiscreteOptionRow(self.options_layout, {'id': oid, 'value': value}))
+
+    def _ui_options(self):
+        """Read option rows from the editor: list of (option_id_or_None, value)."""
+        result = []
+        for i in range(self.options_layout.count()):
+            w = self.options_layout.itemAt(i).widget()
+            if isinstance(w, DiscreteOptionRow):
+                val = w.value_input.text().strip()
+                if val:
+                    result.append((w.option_id, val))
+        return result
+
+    def _referencing_columns(self, conn, type_id):
+        """Return [(table, col)] of object columns whose attribute references this type."""
+        cols = []
+        rows = conn.execute(
+            "SELECT c.name, a.name FROM attributes a JOIN classes c ON a.class_id = c.id "
+            "WHERE a.data_type = 'discrete' AND a.lookup_query = ?", (str(type_id),)).fetchall()
+        for class_name, attr_name in rows:
+            cols.append((f"objects_{sanitize_name(class_name)}", sanitize_name(attr_name)))
+        return cols
+
+    def save_type(self):
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Error", "Type name cannot be empty.")
+            return
+
+        ui_opts = self._ui_options()
+        if not ui_opts:
+            QMessageBox.warning(self, "Error", "A discrete type needs at least one option.")
+            return
+        values = [v for _, v in ui_opts]
+        if len(values) != len(set(values)):
+            QMessageBox.warning(self, "Error", "Option values must be unique within a type.")
+            return
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA foreign_keys = 1")
+                cur = conn.cursor()
+
+                # Unique name check (excluding self)
+                for r_id, r_name in cur.execute("SELECT id, name FROM discrete_types").fetchall():
+                    if r_id != self.current_type_id and r_name.strip().lower() == name.lower():
+                        QMessageBox.warning(self, "Error", f"A discrete type named '{name}' already exists.")
+                        return
+
+                conn.execute("BEGIN IMMEDIATE")
+
+                if self.current_type_id is None:
+                    cur.execute("INSERT INTO discrete_types (name) VALUES (?)", (name,))
+                    self.current_type_id = cur.lastrowid
+                    for order, (_oid, val) in enumerate(ui_opts):
+                        cur.execute("INSERT INTO discrete_options (type_id, value, row_order) VALUES (?, ?, ?)",
+                                    (self.current_type_id, val, order))
+                else:
+                    cur.execute("UPDATE discrete_types SET name = ? WHERE id = ?", (name, self.current_type_id))
+
+                    old_opts = {oid: val for oid, val in cur.execute(
+                        "SELECT id, value FROM discrete_options WHERE type_id = ?", (self.current_type_id,)).fetchall()}
+                    ref_cols = self._referencing_columns(conn, self.current_type_id)
+                    kept_ids = {oid for oid, _ in ui_opts if oid is not None}
+
+                    # Block deletion of an option that is still used by existing data.
+                    for oid, old_val in old_opts.items():
+                        if oid not in kept_ids:
+                            in_use = False
+                            for table, col in ref_cols:
+                                try:
+                                    if cur.execute(f"SELECT 1 FROM {qid(table)} WHERE {qid(col)} = ? LIMIT 1", (old_val,)).fetchone():
+                                        in_use = True
+                                        break
+                                except sqlite3.OperationalError:
+                                    continue
+                            if in_use:
+                                conn.rollback()
+                                QMessageBox.warning(self, "Option In Use",
+                                    f"The option '{old_val}' is still assigned to existing objects and cannot be removed.")
+                                return
+                            cur.execute("DELETE FROM discrete_options WHERE id = ?", (oid,))
+
+                    # Apply inserts / re-order, and collect renames to propagate afterwards.
+                    renames = []  # (oid, old_val, new_val)
+                    for order, (oid, val) in enumerate(ui_opts):
+                        if oid is None:
+                            cur.execute("INSERT INTO discrete_options (type_id, value, row_order) VALUES (?, ?, ?)",
+                                        (self.current_type_id, val, order))
+                        else:
+                            old_val = old_opts.get(oid)
+                            if old_val is not None and old_val != val:
+                                renames.append((oid, old_val, val))
+                            cur.execute("UPDATE discrete_options SET value = ?, row_order = ? WHERE id = ?", (val, order, oid))
+
+                    # Propagate renames into object rows in two phases (old -> sentinel -> new)
+                    # so swapping/chaining labels in one save can't corrupt rows. The \x00
+                    # sentinel can never collide with a real value (it can't be typed).
+                    for table, col in ref_cols:
+                        for oid, old_val, _new in renames:
+                            try:
+                                cur.execute(f"UPDATE {qid(table)} SET {qid(col)} = ? WHERE {qid(col)} = ?", (f"\x00dtmp\x00{oid}", old_val))
+                            except sqlite3.OperationalError:
+                                continue
+                        for oid, _old, new_val in renames:
+                            try:
+                                cur.execute(f"UPDATE {qid(table)} SET {qid(col)} = ? WHERE {qid(col)} = ?", (new_val, f"\x00dtmp\x00{oid}"))
+                            except sqlite3.OperationalError:
+                                continue
+
+                conn.commit()
+            self.refresh_type_list()
+            QMessageBox.information(self, "Success", "Discrete type saved.")
+        except sqlite3.IntegrityError:
+            QMessageBox.warning(self, "Error", "A discrete type with this name already exists.")
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+
+    def delete_type(self):
+        if self.current_type_id is None:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            refs = conn.execute(
+                "SELECT c.name, a.name FROM attributes a JOIN classes c ON a.class_id = c.id "
+                "WHERE a.data_type = 'discrete' AND a.lookup_query = ?", (str(self.current_type_id),)).fetchall()
+        if refs:
+            used = ", ".join(f"{c}.{a}" for c, a in refs)
+            QMessageBox.warning(self, "Type In Use",
+                f"This discrete type is used by: {used}.\n\nRemove or retype those attributes before deleting it.")
+            return
+
+        reply = QMessageBox.question(self, "Delete", "Delete this discrete type and its options?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA foreign_keys = 1")
+                conn.execute("DELETE FROM discrete_types WHERE id = ?", (self.current_type_id,))
+                conn.commit()
+            self.current_type_id = None
+            self.editor_widget.setEnabled(False)
+            self.name_input.clear()
+            self.clear_options()
+            self.refresh_type_list()
 
 
 class ClassBuilderDialog(QDialog):
@@ -332,7 +643,7 @@ class ClassBuilderDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_attr = QPushButton(" Add Attribute")
         btn_attr.setIcon(qta.icon('fa5s.plus'))
-        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.get_all_lookups())))
+        btn_attr.clicked.connect(lambda: self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, self.get_all_lookups(), valid_discrete_types=self.get_all_discrete_types())))
         
         btn_rel = QPushButton(" Add Relationship")
         btn_rel.setIcon(qta.icon('fa5s.plus'))
@@ -387,6 +698,15 @@ class ClassBuilderDialog(QDialog):
         except sqlite3.OperationalError as e:
             if "no such table" not in str(e).lower():
                 QMessageBox.warning(self, "Database Error", f"Error loading lookups: {e}")
+            return []
+
+    def get_all_discrete_types(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, name FROM discrete_types ORDER BY name ASC")
+                return cur.fetchall()
+        except sqlite3.OperationalError:
             return []
 
     def refresh_class_list(self):
@@ -463,6 +783,7 @@ class ClassBuilderDialog(QDialog):
             self.class_path_input.setText(row[1] if row[1] else "")
             
             valid_lookups = self.get_all_lookups()
+            valid_discrete_types = self.get_all_discrete_types()
 
             cur.execute("SELECT id, name, data_type, show_in_table, is_title, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order ASC", (self.current_class_id,))
             attributes = cur.fetchall()
@@ -483,7 +804,7 @@ class ClassBuilderDialog(QDialog):
                     'is_required': is_required,
                     'lookup_query': lookup_query if lookup_query else ''
                 }
-                self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data))
+                self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data, valid_discrete_types=valid_discrete_types))
 
             cur.execute("SELECT id, target_class, rel_type, show_in_base, show_in_target FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
             for rel_id, target, rel_type, show_in_base, show_in_target in cur.fetchall():
@@ -569,6 +890,10 @@ class ClassBuilderDialog(QDialog):
                     QMessageBox.warning(self, "Error", f"Duplicate or colliding attribute detected: '{attr_name}'.")
                     return
                 attr_names.add(safe_name)
+
+                if widget.type_combo.currentText() == "discrete" and widget.discrete_combo.currentData() is None:
+                    QMessageBox.warning(self, "Error", f"The discrete attribute '{attr_name}' has no discrete type selected.")
+                    return
 
         if self.check_for_circular_dependencies(name):
             QMessageBox.critical(self, "Circular Dependency Detected",
@@ -667,10 +992,17 @@ class ClassBuilderDialog(QDialog):
                         
                         show_in_table = 1 if widget.show_cb.isChecked() else 0
                         is_title = 1 if widget.title_cb.isChecked() else 0
-                        # Explicitly save Unique/Req as 0 if look-through
-                        is_unique = 1 if widget.unique_cb.isChecked() and attr_type not in ("look-through", "file") else 0
+                        # Unique is meaningless for look-through / file / discrete.
+                        is_unique = 1 if widget.unique_cb.isChecked() and attr_type not in ("look-through", "file", "discrete") else 0
                         is_required = 1 if widget.req_cb.isChecked() and attr_type != "look-through" else 0
-                        lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
+                        # lookup_query is reused: "Class.Attr" for look-through, the discrete type id for discrete.
+                        if attr_type == "look-through":
+                            lookup_query = widget.lookup_input.currentText().strip()
+                        elif attr_type == "discrete":
+                            d_id = widget.discrete_combo.currentData()
+                            lookup_query = str(d_id) if d_id is not None else ""
+                        else:
+                            lookup_query = ""
                         
                         if widget.attr_id and widget.attr_id in old_attrs:
                             old_attr_name = old_attrs[widget.attr_id]

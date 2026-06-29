@@ -28,7 +28,7 @@ from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression, QUrl
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
 from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValidator, QDesktopServices
 
-from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon, sanitize_name, qid
+from class_builder_dialog import ClassBuilderDialog, DiscreteTypeBuilderDialog, init_db, get_app_icon, sanitize_name, qid
 
 # ==========================================
 # FILE ATTACHMENTS
@@ -616,10 +616,10 @@ class ObjectEditorDialog(QDialog):
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             
-            cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (self.class_id,))
+            cur.execute("SELECT id, name, data_type, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (self.class_id,))
             attributes = cur.fetchall()
 
-            for attr_id, attr_name, attr_type, is_unique, is_required in attributes:
+            for attr_id, attr_name, attr_type, is_unique, is_required, lookup_query in attributes:
                 safe_col_name = sanitize_name(attr_name)
                 
                 if attr_type == "look-through": continue
@@ -649,6 +649,15 @@ class ObjectEditorDialog(QDialog):
                     widget = NullableDateTimeEdit()
                 elif attr_type == "file":
                     widget = FileAttributeWidget(self.db_path)
+                elif attr_type == "discrete":
+                    widget = QComboBox()
+                    widget.addItem("(none)", None)  # blank choice; required check rejects it
+                    try:
+                        type_id = int(lookup_query)
+                        for (opt,) in cur.execute("SELECT value FROM discrete_options WHERE type_id = ? ORDER BY row_order", (type_id,)).fetchall():
+                            widget.addItem(opt, opt)
+                    except (ValueError, TypeError, sqlite3.OperationalError):
+                        pass
                 elif attr_type == "long string":
                     widget = QTextEdit()
                     widget.setMaximumHeight(100) 
@@ -746,6 +755,13 @@ class ObjectEditorDialog(QDialog):
                                 widget.set_value(val)
                             elif isinstance(widget, FileAttributeWidget):
                                 widget.set_existing(val)
+                            elif isinstance(widget, QComboBox):  # discrete
+                                pos = widget.findData(val) if val is not None else 0
+                                if pos < 0:
+                                    # Value no longer in the option set: show it so we don't lose it.
+                                    widget.addItem(str(val), val)
+                                    pos = widget.count() - 1
+                                widget.setCurrentIndex(pos)
                             elif val is not None:
                                 if isinstance(widget, QCheckBox):
                                     widget.setChecked(bool(val))
@@ -823,6 +839,9 @@ class ObjectEditorDialog(QDialog):
                                 files_to_trash.append(action[1])
                         else:  # keep
                             val = action[1]
+                    elif isinstance(widget, QComboBox):  # discrete attribute
+                        val = widget.currentData()
+                        is_empty = (val is None)
                     elif isinstance(widget, QCheckBox):
                         val = 1 if widget.isChecked() else 0
                         is_empty = False
@@ -1120,15 +1139,6 @@ class ModuleBuilderDialog(QDialog):
     def get_all_modules(self):
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS modules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    path TEXT DEFAULT '',
-                    code TEXT DEFAULT ''
-                )
-            """)
-            conn.commit()
             cur.execute("SELECT id, name, path FROM modules ORDER BY path ASC, name ASC")
             return cur.fetchall()
 
@@ -1657,7 +1667,7 @@ class DataBrowserPage(QWidget):
         Returns (attributes, relationships, lookthrough_names) where the import-ready
         header order is ['ID'] + [a.name for attributes] + [r.name for relationships].
         """
-        cur.execute("SELECT id, name, data_type, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (self.current_class_id,))
+        cur.execute("SELECT id, name, data_type, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (self.current_class_id,))
         attr_rows = cur.fetchall()
 
         cur.execute("""
@@ -1669,14 +1679,22 @@ class DataBrowserPage(QWidget):
 
         attributes = []
         lookthrough_names = []
-        for aid, name, dtype, uniq, req in attr_rows:
+        for aid, name, dtype, uniq, req, lookup_query in attr_rows:
             if dtype == "look-through":
                 lookthrough_names.append(name)
                 continue
+            options = None
+            if dtype == "discrete":
+                try:
+                    options = {r[0] for r in cur.execute(
+                        "SELECT value FROM discrete_options WHERE type_id = ?", (int(lookup_query),)).fetchall()}
+                except (ValueError, TypeError, sqlite3.OperationalError):
+                    options = set()
             attributes.append({
                 "name": name, "safe": sanitize_name(name), "type": dtype,
                 "unique": bool(uniq), "required": bool(req),
                 "matrix_count": matrix_counts.get(name, 0),
+                "options": options,
             })
 
         cur.execute("""
@@ -2222,6 +2240,8 @@ class DataBrowserPage(QWidget):
                                 ok, val_final = safe_convert(val, a['type'])
                                 if not ok:
                                     raise ValueError(f"Row {rn}: cannot convert '{val}' for '{a['name']}' ({a['type']}).")
+                                if a['type'] == 'discrete' and a['options'] is not None and val_final not in a['options']:
+                                    raise ValueError(f"Row {rn}: '{val_final}' is not a valid option for '{a['name']}'.")
                                 if a['type'] == 'matrix' and a['matrix_count']:
                                     try:
                                         parsed = ast.literal_eval(val_final)
@@ -2405,7 +2425,11 @@ class MainWindow(QWidget):
         action_builder = QAction(qta.icon('fa5s.tools'), " Class Builder", self)
         action_builder.triggered.connect(self.open_builder)
         db_menu.addAction(action_builder)
-        
+
+        action_discrete = QAction(qta.icon('fa5s.list-ul'), " Discrete Type Builder", self)
+        action_discrete.triggered.connect(self.open_discrete_builder)
+        db_menu.addAction(action_discrete)
+
         action_module = QAction(qta.icon('fa5s.file-code'), " Module Builder", self)
         action_module.triggered.connect(self.open_module_builder)
         db_menu.addAction(action_module)
@@ -2428,7 +2452,11 @@ class MainWindow(QWidget):
     def open_builder(self):
         dialog = ClassBuilderDialog(self)
         dialog.exec()
-        self.refresh_sidebar() 
+        self.refresh_sidebar()
+
+    def open_discrete_builder(self):
+        dialog = DiscreteTypeBuilderDialog(self)
+        dialog.exec()
 
     def open_module_builder(self):
         db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
