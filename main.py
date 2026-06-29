@@ -4,7 +4,6 @@ import os
 import re
 import csv
 import ast
-import uuid
 import shutil
 import datetime
 import traceback
@@ -28,70 +27,11 @@ from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression, QUrl
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
 from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValidator, QDesktopServices
 
-from class_builder_dialog import ClassBuilderDialog, DiscreteTypeBuilderDialog, init_db, get_app_icon, sanitize_name, qid
-
-# ==========================================
-# FILE ATTACHMENTS
-# ==========================================
-# A "file" attribute stores a reference string of the form  <uuid32hex>__<original name>
-# which is ALSO the file's name on disk inside the per-database files folder.
-# The generated views expose only the display part (substr from char 35), so the table,
-# look-throughs and relationship titles all show the clean filename automatically.
-FILES_SUBDIR_SUFFIX = "_files"
-FILE_PREFIX_LEN = 34  # uuid4().hex (32) + "__"
-
-
-def sanitize_filename(name):
-    name = os.path.basename(str(name)).strip()
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
-    return name or "file"
-
-
-def make_stored_filename(original):
-    """Build a collision-proof on-disk/reference name that keeps the original for display."""
-    return f"{uuid.uuid4().hex}__{sanitize_filename(original)}"
-
-
-def display_file_name(stored_value):
-    if not stored_value:
-        return ""
-    return str(stored_value)[FILE_PREFIX_LEN:]
-
-
-def files_dir_for(db_path, create=False):
-    if not db_path:
-        return None
-    base = os.path.dirname(os.path.abspath(db_path))
-    stem = os.path.splitext(os.path.basename(db_path))[0]
-    d = os.path.join(base, stem + FILES_SUBDIR_SUFFIX)
-    if create:
-        os.makedirs(d, exist_ok=True)
-    return d
-
-
-def resolve_file_path(db_path, stored_value):
-    d = files_dir_for(db_path, create=False)
-    if not d or not stored_value:
-        return None
-    return os.path.join(d, str(stored_value))
-
-
-def trash_stored_file(db_path, stored_value):
-    """Move a stored file into the _trash folder (best-effort, recoverable)."""
-    if not stored_value:
-        return
-    src = resolve_file_path(db_path, stored_value)
-    if not src or not os.path.exists(src):
-        return
-    try:
-        trash = os.path.join(files_dir_for(db_path, create=True), "_trash")
-        os.makedirs(trash, exist_ok=True)
-        dest = os.path.join(trash, str(stored_value))
-        if os.path.exists(dest):
-            dest = os.path.join(trash, f"{uuid.uuid4().hex[:8]}_{stored_value}")
-        shutil.move(src, dest)
-    except OSError:
-        pass
+from class_builder_dialog import (
+    ClassBuilderDialog, DiscreteTypeBuilderDialog, init_db, get_app_icon, sanitize_name, qid,
+    FILES_SUBDIR_SUFFIX, FILE_PREFIX_LEN, sanitize_filename, make_stored_filename,
+    display_file_name, files_dir_for, resolve_file_path, trash_stored_file,
+)
 
 # ==========================================
 # PHYSICAL SCHEMA SYNCHRONIZATION

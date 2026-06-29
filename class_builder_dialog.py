@@ -2,6 +2,8 @@ import sys
 import sqlite3
 import os
 import re
+import uuid
+import shutil
 import qtawesome as qta
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -31,6 +33,69 @@ def qid(name):
     if name is None: return ""
     return f"[{str(name).replace(']', ']]')}]"
 
+# ==========================================
+# FILE ATTACHMENTS (shared helpers)
+# ==========================================
+# A "file" attribute stores a reference string of the form  <uuid32hex>__<original name>
+# which is ALSO the file's name on disk inside the per-database files folder.
+# The generated views expose only the display part (substr from char 35), so the table,
+# look-throughs and relationship titles all show the clean filename automatically.
+FILES_SUBDIR_SUFFIX = "_files"
+FILE_PREFIX_LEN = 34  # uuid4().hex (32) + "__"
+
+
+def sanitize_filename(name):
+    name = os.path.basename(str(name)).strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
+    return name or "file"
+
+
+def make_stored_filename(original):
+    """Build a collision-proof on-disk/reference name that keeps the original for display."""
+    return f"{uuid.uuid4().hex}__{sanitize_filename(original)}"
+
+
+def display_file_name(stored_value):
+    if not stored_value:
+        return ""
+    return str(stored_value)[FILE_PREFIX_LEN:]
+
+
+def files_dir_for(db_path, create=False):
+    if not db_path:
+        return None
+    base = os.path.dirname(os.path.abspath(db_path))
+    stem = os.path.splitext(os.path.basename(db_path))[0]
+    d = os.path.join(base, stem + FILES_SUBDIR_SUFFIX)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def resolve_file_path(db_path, stored_value):
+    d = files_dir_for(db_path, create=False)
+    if not d or not stored_value:
+        return None
+    return os.path.join(d, str(stored_value))
+
+
+def trash_stored_file(db_path, stored_value):
+    """Move a stored file into the _trash folder (best-effort, recoverable)."""
+    if not stored_value:
+        return
+    src = resolve_file_path(db_path, stored_value)
+    if not src or not os.path.exists(src):
+        return
+    try:
+        trash = os.path.join(files_dir_for(db_path, create=True), "_trash")
+        os.makedirs(trash, exist_ok=True)
+        dest = os.path.join(trash, str(stored_value))
+        if os.path.exists(dest):
+            dest = os.path.join(trash, f"{uuid.uuid4().hex[:8]}_{stored_value}")
+        shutil.move(src, dest)
+    except OSError:
+        pass
+
 def init_db(db_path=DB_NAME):
     with sqlite3.connect(db_path) as conn:
         # WAL lets readers (the Qt table view) and the writer (sqlite3 DDL/DML)
@@ -55,7 +120,8 @@ def init_db(db_path=DB_NAME):
                 is_title INTEGER DEFAULT 0,
                 is_unique INTEGER DEFAULT 0,
                 is_required INTEGER DEFAULT 0,
-                lookup_query TEXT DEFAULT ''
+                lookup_query TEXT DEFAULT '',
+                FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS matrix_columns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1088,21 +1154,62 @@ class ClassBuilderDialog(QDialog):
 
     def delete_class(self):
         if self.current_class_id is None: return
-        reply = QMessageBox.question(self, "Delete", "Are you sure you want to delete this class?", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("PRAGMA foreign_keys = 1")
-                    conn.execute("BEGIN IMMEDIATE")
-                    conn.execute("DELETE FROM classes WHERE id = ?", (self.current_class_id,))
-                    conn.commit()
-                
-                self.current_class_id = None
-                self.editor_widget.setEnabled(False)
-                self.clear_layout(self.attributes_layout)
-                self.clear_layout(self.relationships_layout)
-                self.class_name_input.clear()
-                self.class_path_input.clear()
-                self.refresh_class_list()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+        reply = QMessageBox.question(self, "Delete",
+            "Are you sure you want to delete this class?\n\nIts data table, views and any attached files will also be removed.",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cid = self.current_class_id
+
+                row = cur.execute("SELECT name FROM classes WHERE id = ?", (cid,)).fetchone()
+                if not row:
+                    self.refresh_class_list()
+                    return
+                safe_class = sanitize_name(row[0])
+                table = f"objects_{safe_class}"
+
+                # Gather physical artifacts BEFORE deleting the metadata (it cascades away).
+                stored_files = []
+                file_cols = [sanitize_name(n) for (n,) in cur.execute(
+                    "SELECT name FROM attributes WHERE class_id = ? AND data_type = 'file'", (cid,)).fetchall()]
+                if file_cols:
+                    try:
+                        sel = ", ".join(qid(c) for c in file_cols)
+                        for r in cur.execute(f"SELECT {sel} FROM {qid(table)}").fetchall():
+                            stored_files.extend([v for v in r if v])
+                    except sqlite3.OperationalError:
+                        pass
+
+                junctions = []
+                for (tgt,) in cur.execute(
+                    "SELECT c.name FROM relationships r JOIN classes c ON r.target_class = c.id WHERE r.source_class = ?", (cid,)).fetchall():
+                    junctions.append(f"rel_{table}_to_objects_{sanitize_name(tgt)}")
+                for (src,) in cur.execute(
+                    "SELECT c.name FROM relationships r JOIN classes c ON r.source_class = c.id WHERE r.target_class = ?", (cid,)).fetchall():
+                    junctions.append(f"rel_objects_{sanitize_name(src)}_to_{table}")
+
+                conn.execute("PRAGMA foreign_keys = 1")
+                conn.execute("BEGIN IMMEDIATE")
+                cur.execute("DELETE FROM classes WHERE id = ?", (cid,))
+                for v in (f"view_{table}", f"full_view_{table}", f"base_view_{table}"):
+                    cur.execute(f"DROP VIEW IF EXISTS {qid(v)}")
+                for j in junctions:  # drop children (FK references) before the parent table
+                    cur.execute(f"DROP TABLE IF EXISTS {qid(j)}")
+                cur.execute(f"DROP TABLE IF EXISTS {qid(table)}")
+                conn.commit()
+
+            for stored in stored_files:
+                trash_stored_file(self.db_path, stored)
+
+            self.current_class_id = None
+            self.editor_widget.setEnabled(False)
+            self.clear_layout(self.attributes_layout)
+            self.clear_layout(self.relationships_layout)
+            self.class_name_input.clear()
+            self.class_path_input.clear()
+            self.refresh_class_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
