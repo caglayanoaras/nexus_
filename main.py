@@ -4,6 +4,8 @@ import os
 import re
 import csv
 import ast
+import uuid
+import shutil
 import datetime
 import traceback
 import qtawesome as qta
@@ -22,11 +24,74 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QTextEdit, QDateTimeEdit, QCheckBox, QPlainTextEdit, QTabWidget,
     QMenuBar, QMenu, QRadioButton, QGroupBox, QDialogButtonBox, QTextBrowser
 )
-from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression
+from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression, QUrl
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
-from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValidator
+from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValidator, QDesktopServices
 
 from class_builder_dialog import ClassBuilderDialog, init_db, get_app_icon, sanitize_name, qid
+
+# ==========================================
+# FILE ATTACHMENTS
+# ==========================================
+# A "file" attribute stores a reference string of the form  <uuid32hex>__<original name>
+# which is ALSO the file's name on disk inside the per-database files folder.
+# The generated views expose only the display part (substr from char 35), so the table,
+# look-throughs and relationship titles all show the clean filename automatically.
+FILES_SUBDIR_SUFFIX = "_files"
+FILE_PREFIX_LEN = 34  # uuid4().hex (32) + "__"
+
+
+def sanitize_filename(name):
+    name = os.path.basename(str(name)).strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
+    return name or "file"
+
+
+def make_stored_filename(original):
+    """Build a collision-proof on-disk/reference name that keeps the original for display."""
+    return f"{uuid.uuid4().hex}__{sanitize_filename(original)}"
+
+
+def display_file_name(stored_value):
+    if not stored_value:
+        return ""
+    return str(stored_value)[FILE_PREFIX_LEN:]
+
+
+def files_dir_for(db_path, create=False):
+    if not db_path:
+        return None
+    base = os.path.dirname(os.path.abspath(db_path))
+    stem = os.path.splitext(os.path.basename(db_path))[0]
+    d = os.path.join(base, stem + FILES_SUBDIR_SUFFIX)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def resolve_file_path(db_path, stored_value):
+    d = files_dir_for(db_path, create=False)
+    if not d or not stored_value:
+        return None
+    return os.path.join(d, str(stored_value))
+
+
+def trash_stored_file(db_path, stored_value):
+    """Move a stored file into the _trash folder (best-effort, recoverable)."""
+    if not stored_value:
+        return
+    src = resolve_file_path(db_path, stored_value)
+    if not src or not os.path.exists(src):
+        return
+    try:
+        trash = os.path.join(files_dir_for(db_path, create=True), "_trash")
+        os.makedirs(trash, exist_ok=True)
+        dest = os.path.join(trash, str(stored_value))
+        if os.path.exists(dest):
+            dest = os.path.join(trash, f"{uuid.uuid4().hex[:8]}_{stored_value}")
+        shutil.move(src, dest)
+    except OSError:
+        pass
 
 # ==========================================
 # PHYSICAL SCHEMA SYNCHRONIZATION
@@ -305,6 +370,10 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                         raise ValueError(f"Invalid lookup format '{lookup_query}'. Expected 'TargetClass.Attribute'.")
                 else:
                     base_selects.append(f"NULL AS {qid(attr_name)}")
+            elif attr_type == "file":
+                # The raw column holds "<uuid>__name"; expose only the display name so the
+                # table, look-throughs and relationship titles show the clean filename.
+                base_selects.append(f"substr(m.{qid(safe_col_name)}, {FILE_PREFIX_LEN + 1}) AS {qid(attr_name)}")
             else:
                 base_selects.append(f"m.{qid(safe_col_name)} AS {qid(attr_name)}")
 
@@ -412,6 +481,109 @@ class NullableDateTimeEdit(QWidget):
             self.edit.setEnabled(True)
 
 
+class FileAttributeWidget(QWidget):
+    """Attach / open / clear a single file for a 'file' attribute.
+
+    Keeps the existing stored reference until the user picks a new file or clears it.
+    The actual copy into storage happens at save time (transaction-safe), via plan().
+    """
+    def __init__(self, db_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.current = None      # existing stored reference ("<uuid>__name") or None
+        self.pending = None      # absolute path of a newly chosen file, or None
+        self.cleared = False     # user explicitly cleared an existing file
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self.label = QLabel()
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.btn_choose = QPushButton(" Choose...")
+        self.btn_choose.setIcon(qta.icon('fa5s.folder-open'))
+        self.btn_choose.clicked.connect(self._choose)
+
+        self.btn_open = QPushButton()
+        self.btn_open.setIcon(qta.icon('fa5s.external-link-alt'))
+        self.btn_open.setToolTip("Open the current file")
+        self.btn_open.setFixedWidth(32)
+        self.btn_open.clicked.connect(self._open)
+
+        self.btn_clear = QPushButton()
+        self.btn_clear.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
+        self.btn_clear.setToolTip("Remove the attached file")
+        self.btn_clear.setFixedWidth(32)
+        self.btn_clear.clicked.connect(self._clear)
+
+        lay.addWidget(self.label, 1)
+        lay.addWidget(self.btn_choose)
+        lay.addWidget(self.btn_open)
+        lay.addWidget(self.btn_clear)
+        self._refresh()
+
+    def set_existing(self, stored_value):
+        self.current = stored_value or None
+        self.pending = None
+        self.cleared = False
+        self._refresh()
+
+    def _refresh(self):
+        if self.pending:
+            self.label.setText(f"<b>{os.path.basename(self.pending)}</b> <span style='color:#888;'>(new)</span>")
+            self.btn_open.setEnabled(True)
+            self.btn_clear.setEnabled(True)
+            return
+        if self.current and not self.cleared:
+            name = display_file_name(self.current)
+            path = resolve_file_path(self.db_path, self.current)
+            if path and os.path.exists(path):
+                self.label.setText(name)
+            else:
+                self.label.setText(f"{name} <span style='color:#cc8800;'>&#9888; missing</span>")
+                self.label.setToolTip("The stored file is no longer in the files folder.")
+            self.btn_open.setEnabled(True)
+            self.btn_clear.setEnabled(True)
+            return
+        self.label.setText("<span style='color:#888;'>No file</span>")
+        self.btn_open.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+
+    def _choose(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a file to attach", "", "All Files (*.*)")
+        if path:
+            self.pending = path
+            self.cleared = False
+            self._refresh()
+
+    def _clear(self):
+        self.pending = None
+        self.cleared = True
+        self._refresh()
+
+    def _open(self):
+        target = self.pending or (resolve_file_path(self.db_path, self.current) if (self.current and not self.cleared) else None)
+        if target and os.path.exists(target):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(target)))
+        else:
+            QMessageBox.warning(self, "File Not Found", "The file could not be found on disk.")
+
+    def is_empty(self):
+        if self.pending:
+            return False
+        return self.cleared or not self.current
+
+    def plan(self):
+        """Return the save action: ('new', src, new_stored, old) | ('clear', old) | ('keep', current)."""
+        if self.pending:
+            new_stored = make_stored_filename(self.pending)
+            return ('new', self.pending, new_stored, self.current)
+        if self.cleared:
+            return ('clear', self.current)
+        return ('keep', self.current)
+
+
 class ObjectEditorDialog(QDialog):
     def __init__(self, db_path, class_id, class_name, table_name, obj_id=None, parent=None):
         super().__init__(parent)
@@ -475,6 +647,8 @@ class ObjectEditorDialog(QDialog):
                     widget = QCheckBox("Yes / True")
                 elif attr_type == "date":
                     widget = NullableDateTimeEdit()
+                elif attr_type == "file":
+                    widget = FileAttributeWidget(self.db_path)
                 elif attr_type == "long string":
                     widget = QTextEdit()
                     widget.setMaximumHeight(100) 
@@ -570,6 +744,8 @@ class ObjectEditorDialog(QDialog):
                             if isinstance(widget, NullableDateTimeEdit):
                                 # Always call (even for None) so a stored NULL unticks the box.
                                 widget.set_value(val)
+                            elif isinstance(widget, FileAttributeWidget):
+                                widget.set_existing(val)
                             elif val is not None:
                                 if isinstance(widget, QCheckBox):
                                     widget.setChecked(bool(val))
@@ -624,13 +800,30 @@ class ObjectEditorDialog(QDialog):
                 columns = []
                 values = []
                 placeholders = []
-                
+                file_copies = []      # (source_path, stored_name) to copy into storage on commit
+                files_to_trash = []   # old stored names to trash after a successful commit
+
                 for col_name, widget in self.input_widgets.items():
                     app_type = self.attr_app_types.get(col_name)
                     constraints = self.attr_constraints.get(col_name)
                     attr_display_name = constraints['name']
-                    
-                    if isinstance(widget, QCheckBox):
+
+                    if isinstance(widget, FileAttributeWidget):
+                        action = widget.plan()
+                        is_empty = widget.is_empty()
+                        if action[0] == 'new':
+                            _, src, new_stored, old = action
+                            val = new_stored
+                            file_copies.append((src, new_stored))
+                            if old:
+                                files_to_trash.append(old)
+                        elif action[0] == 'clear':
+                            val = None
+                            if action[1]:
+                                files_to_trash.append(action[1])
+                        else:  # keep
+                            val = action[1]
+                    elif isinstance(widget, QCheckBox):
                         val = 1 if widget.isChecked() else 0
                         is_empty = False
                     elif isinstance(widget, NullableDateTimeEdit):
@@ -694,7 +887,17 @@ class ObjectEditorDialog(QDialog):
                     placeholders.append("?")
                     values.append(val)
 
+                copied_abs = []
                 try:
+                    # Copy new attachments into storage first; if the DB write fails we
+                    # delete them again so nothing is stranded.
+                    if file_copies:
+                        files_dir = files_dir_for(self.db_path, create=True)
+                        for src, dest_name in file_copies:
+                            dest_abs = os.path.join(files_dir, dest_name)
+                            shutil.copy2(src, dest_abs)
+                            copied_abs.append(dest_abs)
+
                     conn.execute("BEGIN IMMEDIATE")
                     active_obj_id = self.obj_id
 
@@ -721,11 +924,19 @@ class ObjectEditorDialog(QDialog):
                             cur.execute(f"INSERT INTO {qid(junc_table)} (source_id, target_id) VALUES (?, ?)", (active_obj_id, target_id))
                     
                     conn.commit()
+                    # Commit succeeded: retire replaced/cleared files to the trash folder.
+                    for old in files_to_trash:
+                        trash_stored_file(self.db_path, old)
                     self.accept()
                 except Exception as e:
                     conn.rollback()
+                    for path in copied_abs:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
                     raise e
-            
+
         except Exception as e:
             QMessageBox.critical(self, "Database Error", str(e))
 
@@ -1177,6 +1388,7 @@ class DataBrowserPage(QWidget):
         self.current_table_name = None
         self.db_path = ""
         self.hidden_columns_memory = {}
+        self.file_columns = {}  # display header -> safe column name, for 'file' attributes
         
         self.page_size = 100
         self.current_page = 0
@@ -1260,7 +1472,7 @@ class DataBrowserPage(QWidget):
         self.table_view.setSelectionBehavior(QTableView.SelectRows)
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setEditTriggers(QTableView.NoEditTriggers)
-        self.table_view.doubleClicked.connect(self.open_edit_dialog)
+        self.table_view.doubleClicked.connect(self.on_cell_double_clicked)
         self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self.show_context_menu)
         self.table_view.setSortingEnabled(True)
@@ -1332,7 +1544,10 @@ class DataBrowserPage(QWidget):
                 cur = conn.cursor()
                 cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
                 columns = [row[1] for row in cur.fetchall()]
-            
+
+                cur.execute("SELECT name FROM attributes WHERE class_id = ? AND data_type = 'file'", (class_id,))
+                self.file_columns = {row[0]: sanitize_name(row[0]) for row in cur.fetchall()}
+
             if not columns:
                 raise sqlite3.OperationalError(f"View '{self.current_view_name}' is broken and returned no columns.")
                 
@@ -1625,24 +1840,87 @@ class DataBrowserPage(QWidget):
         dialog = ObjectEditorDialog(self.db_path, self.current_class_id, self.current_class_name, self.current_table_name, None, self)
         if dialog.exec(): self.build_and_exec_query() 
             
+    def on_cell_double_clicked(self, index):
+        # Double-clicking a 'file' cell opens/saves the attachment; any other cell edits the row.
+        header = self.query_model.headerData(index.column(), Qt.Horizontal)
+        if header in self.file_columns:
+            self._open_file_cell(index, self.file_columns[header])
+        else:
+            self.open_edit_dialog()
+
+    def _open_file_cell(self, index, safe_col):
+        id_index = self.query_model.index(index.row(), 0)
+        obj_id = self.query_model.data(id_index)
+        if not obj_id:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(f"SELECT {qid(safe_col)} FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,)).fetchone()
+        stored = row[0] if row else None
+        if not stored:
+            QMessageBox.information(self, "No File", "There is no file attached to this cell.")
+            return
+
+        path = resolve_file_path(self.db_path, stored)
+        display = display_file_name(stored)
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "File Not Found",
+                f"'{display}' is referenced by this record but is no longer in the files folder.")
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("File")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"<b>{display}</b>")
+        box.setInformativeText("What would you like to do?")
+        btn_open = box.addButton(" Open", QMessageBox.AcceptRole)
+        btn_open.setIcon(qta.icon('fa5s.external-link-alt'))
+        btn_save = box.addButton(" Save As...", QMessageBox.ActionRole)
+        btn_save.setIcon(qta.icon('fa5s.download'))
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked == btn_open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))
+        elif clicked == btn_save:
+            dest, _ = QFileDialog.getSaveFileName(self, "Save File As", display, "All Files (*.*)")
+            if dest:
+                try:
+                    shutil.copy2(path, dest)
+                except OSError as e:
+                    QMessageBox.critical(self, "Save Failed", str(e))
+
     def open_edit_dialog(self):
         obj_id = self.get_selected_id()
         if not obj_id: return
         dialog = ObjectEditorDialog(self.db_path, self.current_class_id, self.current_class_name, self.current_table_name, obj_id, self)
-        if dialog.exec(): self.build_and_exec_query() 
-            
+        if dialog.exec(): self.build_and_exec_query()
+
     def delete_selected(self):
         obj_id = self.get_selected_id()
         if not obj_id: return
         reply = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete this {self.current_class_name}?\n\nIts relationships will be automatically safely removed.", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             try:
+                # Collect attached files first so we can retire them after a successful delete.
+                stored_files = []
+                if self.file_columns:
+                    with sqlite3.connect(self.db_path) as conn:
+                        cols = list(self.file_columns.values())
+                        sel = ", ".join(qid(c) for c in cols)
+                        r = conn.execute(f"SELECT {sel} FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,)).fetchone()
+                        if r:
+                            stored_files = [v for v in r if v]
+
                 with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("PRAGMA foreign_keys = 1") 
+                    conn.execute("PRAGMA foreign_keys = 1")
                     conn.execute("BEGIN IMMEDIATE")
                     conn.execute(f"DELETE FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,))
                     conn.commit()
-                    
+
+                for stored in stored_files:
+                    trash_stored_file(self.db_path, stored)
+
                 self.build_and_exec_query()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -1712,7 +1990,11 @@ class DataBrowserPage(QWidget):
                     return headers, []
 
                 selects = ["m.id"]
-                selects += [f"m.{qid(a['safe'])}" for a in attrs]
+                # 'file' columns export the display name (not the raw "<uuid>__name" reference).
+                selects += [
+                    (f"substr(m.{qid(a['safe'])}, {FILE_PREFIX_LEN + 1})" if a['type'] == 'file' else f"m.{qid(a['safe'])}")
+                    for a in attrs
+                ]
                 selects += [f"(SELECT GROUP_CONCAT(target_id) FROM {qid(r['junc_table'])} WHERE source_id = m.id)" for r in rels]
                 sql = f"SELECT {', '.join(selects)} FROM {qid(self.current_table_name)} m"
 
@@ -1779,8 +2061,10 @@ class DataBrowserPage(QWidget):
             if s in attr_by_safe:
                 if s in seen: duplicates.append(disp)
                 seen.add(s); mapped_attr_safes.add(s)
-                col_map.append(('attr', attr_by_safe[s]))
-                columns.append((disp, "Attribute", "ok")); continue
+                a = attr_by_safe[s]
+                col_map.append(('attr', a))
+                label = "File (loaded from this sheet's folder)" if a['type'] == 'file' else "Attribute"
+                columns.append((disp, label, "ok")); continue
             if s in rel_by_safe:
                 if s in seen: duplicates.append(disp)
                 seen.add(s)
@@ -1839,13 +2123,15 @@ class DataBrowserPage(QWidget):
         dlg = ImportPreviewDialog(self, analysis)
         if not dlg.exec(): return
 
-        self._run_import(all_rows, attrs, rels, analysis)
+        self._run_import(all_rows, attrs, rels, analysis, os.path.dirname(os.path.abspath(file_path)))
 
-    def _run_import(self, all_rows, attrs, rels, analysis):
+    def _run_import(self, all_rows, attrs, rels, analysis, source_dir):
         col_map = analysis['col_map']
         id_idx = analysis['id_col_index']
         table = self.current_table_name
 
+        copied_abs = []     # files copied into storage this run (deleted on failure)
+        old_to_trash = []   # replaced file references to retire after a successful commit
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
@@ -1903,11 +2189,28 @@ class DataBrowserPage(QWidget):
                             else:
                                 mode, target_id = 'insert', None  # unknown ID -> add as new
 
-                    set_cols, set_vals, rels_in_row = [], [], {}
+                    set_cols, set_vals, rels_in_row, file_ops_row = [], [], {}, []
 
                     for idx, (kind, obj) in enumerate(col_map):
                         if idx >= len(row):
                             break
+                        if kind == 'attr' and obj['type'] == 'file':
+                            a = obj
+                            val = self._cell_to_value(row[idx])
+                            if val is None:
+                                # Empty cell = keep the existing attachment (do not clear).
+                                if a['required'] and mode == 'insert':
+                                    raise ValueError(f"Row {rn}: '{a['name']}' is required but empty.")
+                                continue
+                            fname = os.path.basename(val)
+                            src = os.path.join(source_dir, fname)
+                            if not os.path.isfile(src):
+                                raise ValueError(f"Row {rn}: file '{fname}' for '{a['name']}' was not found next to the import file.")
+                            new_stored = make_stored_filename(fname)
+                            set_cols.append(a['safe'])
+                            set_vals.append(new_stored)
+                            file_ops_row.append((a['safe'], src, new_stored))
+                            continue
                         if kind == 'attr':
                             a = obj
                             val = self._cell_to_value(row[idx])
@@ -1963,12 +2266,28 @@ class DataBrowserPage(QWidget):
                                     tids.append(tid)
                             rels_in_row[r['safe']] = tids  # column present -> replace links
 
-                    ops.append({'mode': mode, 'id': target_id, 'cols': set_cols, 'vals': set_vals, 'rels': rels_in_row})
+                    ops.append({'mode': mode, 'id': target_id, 'cols': set_cols, 'vals': set_vals,
+                                'rels': rels_in_row, 'files': file_ops_row})
 
                 # --- apply atomically ---
                 inserted = updated = 0
+                files_dir = files_dir_for(self.db_path, create=True) if any(op['files'] for op in ops) else None
                 conn.execute("BEGIN IMMEDIATE")
                 for op in ops:
+                    # On update, remember the file(s) we're about to replace so we can trash them.
+                    if op['mode'] == 'update' and op['files']:
+                        cols = [f[0] for f in op['files']]
+                        sel = ", ".join(qid(c) for c in cols)
+                        oldrow = cur.execute(f"SELECT {sel} FROM {qid(table)} WHERE id = ?", (op['id'],)).fetchone()
+                        if oldrow:
+                            old_to_trash.extend([v for v in oldrow if v])
+
+                    # Copy new attachments into storage before the row write.
+                    for (safe_col, src, new_stored) in op['files']:
+                        dest_abs = os.path.join(files_dir, new_stored)
+                        shutil.copy2(src, dest_abs)
+                        copied_abs.append(dest_abs)
+
                     if op['mode'] == 'update':
                         oid = op['id']
                         if op['cols']:
@@ -1992,10 +2311,18 @@ class DataBrowserPage(QWidget):
 
                 conn.commit()
 
+            for old in old_to_trash:
+                trash_stored_file(self.db_path, old)
+
             self.build_and_exec_query()
             QMessageBox.information(self, "Import Complete",
                 f"Added {inserted} and updated {updated} object(s).")
         except Exception as e:
+            for path in copied_abs:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             QMessageBox.critical(self, "Import Failed",
                 f"Import aborted. No changes were made to the database.\n\nReason:\n{e}")
 
@@ -2083,6 +2410,11 @@ class MainWindow(QWidget):
         action_module.triggered.connect(self.open_module_builder)
         db_menu.addAction(action_module)
 
+        db_menu.addSeparator()
+        action_cleanup = QAction(qta.icon('fa5s.broom'), " Clean Up Unused Files", self)
+        action_cleanup.triggered.connect(self.clean_unused_files)
+        db_menu.addAction(action_cleanup)
+
         doc_menu = menubar.addMenu("Documentation")
         action_api = QAction(qta.icon('fa5s.book'), " Module API", self)
         action_api.triggered.connect(self.open_module_api)
@@ -2106,6 +2438,47 @@ class MainWindow(QWidget):
         
     def open_module_api(self):
         QMessageBox.information(self, "Module API", "Documentation coming soon...\n\nCurrently available built-in functions:\n\nget_objects(class_name)\n-> Returns a complete Pandas DataFrame of the specified class, including automatically resolved multi-title relationships.")
+
+    def clean_unused_files(self):
+        """Move any file in the storage folder that no record references into _trash."""
+        db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+        files_dir = files_dir_for(db_path, create=False)
+        if not files_dir or not os.path.isdir(files_dir):
+            QMessageBox.information(self, "Clean Up", "There is no files folder yet — nothing to clean.")
+            return
+
+        referenced = set()
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT c.name, a.name FROM attributes a
+                    JOIN classes c ON a.class_id = c.id
+                    WHERE a.data_type = 'file'
+                """)
+                file_attrs = cur.fetchall()
+                for class_name, attr_name in file_attrs:
+                    table = f"objects_{sanitize_name(class_name)}"
+                    col = sanitize_name(attr_name)
+                    try:
+                        cur.execute(f"SELECT {qid(col)} FROM {qid(table)} WHERE {qid(col)} IS NOT NULL")
+                        referenced.update(r[0] for r in cur.fetchall() if r[0])
+                    except sqlite3.OperationalError:
+                        continue
+        except sqlite3.OperationalError:
+            pass
+
+        moved = 0
+        for entry in os.listdir(files_dir):
+            full = os.path.join(files_dir, entry)
+            if entry == "_trash" or not os.path.isfile(full):
+                continue
+            if entry not in referenced:
+                trash_stored_file(db_path, entry)
+                moved += 1
+
+        QMessageBox.information(self, "Clean Up Complete",
+            f"Moved {moved} unused file(s) to the _trash folder inside:\n{files_dir}")
 
     def sync_all_classes(self, db_path):
         with sqlite3.connect(db_path) as conn:

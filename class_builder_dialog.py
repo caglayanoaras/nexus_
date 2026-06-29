@@ -135,7 +135,7 @@ class AttributeRow(ReorderableRow):
         
         self.type_combo = QComboBox()
         self.type_combo.addItems([
-            "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "look-through"
+            "int", "float", "string", "long string", "date", "boolean", "list", "matrix", "file", "look-through"
         ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         
@@ -191,9 +191,11 @@ class AttributeRow(ReorderableRow):
     def on_type_changed(self, text):
         self.matrix_btn.setVisible(text == "matrix")
         self.lookup_input.setVisible(text == "look-through")
-        
+
         is_look_through = (text == "look-through")
-        self.unique_cb.setVisible(not is_look_through)
+        is_file = (text == "file")
+        # Files can be required and used as titles, but uniqueness is meaningless for them.
+        self.unique_cb.setVisible(not is_look_through and not is_file)
         self.req_cb.setVisible(not is_look_through)
 
     def set_matrix_columns(self):
@@ -666,7 +668,7 @@ class ClassBuilderDialog(QDialog):
                         show_in_table = 1 if widget.show_cb.isChecked() else 0
                         is_title = 1 if widget.title_cb.isChecked() else 0
                         # Explicitly save Unique/Req as 0 if look-through
-                        is_unique = 1 if widget.unique_cb.isChecked() and attr_type != "look-through" else 0
+                        is_unique = 1 if widget.unique_cb.isChecked() and attr_type not in ("look-through", "file") else 0
                         is_required = 1 if widget.req_cb.isChecked() and attr_type != "look-through" else 0
                         lookup_query = widget.lookup_input.currentText().strip() if attr_type == "look-through" else ""
                         
