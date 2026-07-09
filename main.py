@@ -30,7 +30,7 @@ from PySide6.QtGui import QAction, QFontDatabase, QFont, QRegularExpressionValid
 from class_builder_dialog import (
     ClassBuilderDialog, DiscreteTypeBuilderDialog, init_db, get_app_icon, sanitize_name, qid,
     FILES_SUBDIR_SUFFIX, FILE_PREFIX_LEN, sanitize_filename, make_stored_filename,
-    display_file_name, files_dir_for, resolve_file_path, trash_stored_file,
+    display_file_name, files_dir_for, resolve_file_path, trash_stored_file, parse_boolean,
 )
 
 # ==========================================
@@ -41,9 +41,9 @@ def safe_convert(val, app_type):
     if val is None or str(val).strip() == "": return True, None
     try:
         if app_type == "boolean":
-            v = int(float(val))
-            if v in (0, 1): return True, v
-            return False, None
+            # Accept human-friendly truthy/falsy text (Yes/No/True/False/…), not just 0/1,
+            # so hand-filled import templates aren't rejected.
+            return True, parse_boolean(val)
         elif app_type == "int":
             return True, int(float(val))
         elif app_type == "float":
@@ -77,7 +77,8 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             if attr_type == "look-through":
                 attr_app_types[safe_col_name] = attr_type
                 if lookup_query:
-                    parts = lookup_query.split('.')
+                    # Split on the FIRST dot only: the attribute part may itself contain dots.
+                    parts = lookup_query.split('.', 1)
                     if len(parts) == 2:
                         tgt_class = sanitize_name(parts[0].strip())
                         cur.execute(f"CREATE TABLE IF NOT EXISTS {qid('objects_' + tgt_class)} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
@@ -292,7 +293,8 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             safe_col_name = sanitize_name(attr_name)
             if attr_type == "look-through":
                 if lookup_query:
-                    parts = lookup_query.split('.')
+                    # Split on the FIRST dot only: the attribute part may itself contain dots.
+                    parts = lookup_query.split('.', 1)
                     if len(parts) == 2:
                         tgt_class, tgt_attr = parts
                         safe_tgt_class = sanitize_name(tgt_class.strip())
@@ -1205,12 +1207,13 @@ class ModuleBuilderDialog(QDialog):
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
         context = {'get_objects': self.get_objects, 'pd': pd}
-        
+
         try:
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(f"--- Script Executed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
+            # Append (don't truncate) so each run keeps the previous output as history.
+            with open(out_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n--- Script Executed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
                 with redirect_stdout(f), redirect_stderr(f): exec(code, context)
-            QMessageBox.information(self, "Success", f"Script executed successfully.\nOutput saved to:\n{out_path}")
+            QMessageBox.information(self, "Success", f"Script executed successfully.\nOutput appended to:\n{out_path}")
         except Exception as e:
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write("\n\n--- RUNTIME ERROR ---\n")
@@ -1638,13 +1641,13 @@ class DataBrowserPage(QWidget):
             })
 
         cur.execute("""
-            SELECT c.id, c.name FROM relationships r
+            SELECT c.id, c.name, r.rel_type FROM relationships r
             JOIN classes c ON r.target_class = c.id
             WHERE r.source_class = ? ORDER BY r.row_order
         """, (self.current_class_id,))
         relationships = []
         seen = set()
-        for tcid, tname in cur.fetchall():
+        for tcid, tname, rel_type in cur.fetchall():
             safe_t = sanitize_name(tname)
             if safe_t in seen:
                 continue
@@ -1652,7 +1655,7 @@ class DataBrowserPage(QWidget):
             cur.execute("SELECT name FROM attributes WHERE class_id = ? AND is_title = 1 ORDER BY row_order", (tcid,))
             title_cols = [r[0] for r in cur.fetchall()]
             relationships.append({
-                "name": tname, "safe": safe_t,
+                "name": tname, "safe": safe_t, "rel_type": rel_type,
                 "target_table": f"objects_{safe_t}",
                 "junc_table": f"rel_{self.current_table_name}_to_objects_{safe_t}",
                 "base_view": f"base_view_objects_{safe_t}",
@@ -2120,7 +2123,8 @@ class DataBrowserPage(QWidget):
                         except sqlite3.OperationalError:
                             title_map = None
                     rel_data[r['safe']] = {'ids': tids, 'title_map': title_map,
-                                           'junc': r['junc_table'], 'name': r['name']}
+                                           'junc': r['junc_table'], 'name': r['name'],
+                                           'rel_type': r['rel_type']}
 
                 # --- validate every row first (nothing written yet) ---
                 file_unique_used = {}  # (safe, value) -> row_number
@@ -2224,7 +2228,14 @@ class DataBrowserPage(QWidget):
                                     else:
                                         raise ValueError(f"Row {rn}: '{r['name']}' must use numeric IDs (target has no single title column).")
                                     tids.append(tid)
-                            rels_in_row[r['safe']] = tids  # column present -> replace links
+                            # De-duplicate (preserving order) so '1,1' can't create twin links,
+                            # and enforce one_to_many cardinality that the object editor also enforces.
+                            unique_tids = list(dict.fromkeys(tids))
+                            if rd['rel_type'] == 'one_to_many' and len(unique_tids) > 1:
+                                raise ValueError(
+                                    f"Row {rn}: '{r['name']}' is a one-to-many relationship and accepts "
+                                    f"a single target, but {len(unique_tids)} were given.")
+                            rels_in_row[r['safe']] = unique_tids  # column present -> replace links
 
                     ops.append({'mode': mode, 'id': target_id, 'cols': set_cols, 'vals': set_vals,
                                 'rels': rels_in_row, 'files': file_ops_row})
@@ -2385,9 +2396,14 @@ class MainWindow(QWidget):
         doc_menu.addAction(action_api)
 
     def open_settings(self):
+        settings = QSettings("MyCompany", "DatabaseManagerApp")
+        old_db = settings.value("db_path", "")
         dialog = SettingsDialog(self)
         dialog.exec()
-        self.refresh_sidebar()
+        new_db = settings.value("db_path", "")
+        # Only re-run the (heavy, potentially dialog-popping) schema sync when the
+        # database actually changed — not when just the module output path was edited.
+        self.refresh_sidebar(do_sync=(old_db != new_db))
 
     def open_builder(self):
         dialog = ClassBuilderDialog(self)
@@ -2504,7 +2520,7 @@ class MainWindow(QWidget):
             error_msg = "The following configuration errors were detected during sync. Some views might not load perfectly until you fix their schemas:\n\n" + "\n".join(sync_errors)
             QMessageBox.warning(self, "Database Schema Warnings", error_msg)
 
-    def refresh_sidebar(self):
+    def refresh_sidebar(self, do_sync=True):
         self.sidebar.clear()
         settings = QSettings("MyCompany", "DatabaseManagerApp")
         db_path = settings.value("db_path", "")
@@ -2530,9 +2546,10 @@ class MainWindow(QWidget):
         db.setDatabaseName(db_path)
         if not db.open(): return
 
-        # Drop any read lock the data view holds before sync_all_classes runs DDL.
-        self.data_browser.query_model.clear()
-        self.sync_all_classes(db_path)
+        if do_sync:
+            # Drop any read lock the data view holds before sync_all_classes runs DDL.
+            self.data_browser.query_model.clear()
+            self.sync_all_classes(db_path)
 
         try:
             with sqlite3.connect(db_path) as conn:
@@ -2661,7 +2678,10 @@ class MainWindow(QWidget):
                     raise ValueError(f"Class '{class_name}' not found.")
                 cls_id = r[0]
                 
-            view_name, safe_table_name = sync_physical_table(db_path, cls_id, class_name, parent_widget=self)
+            # parent_widget=None: a report run must never pop a modal schema/data-loss
+            # dialog. If a destructive conversion is pending, sync raises and the error
+            # is written to the output file instead of blocking the script.
+            view_name, safe_table_name = sync_physical_table(db_path, cls_id, class_name, parent_widget=None)
             if not view_name: raise RuntimeError(f"Failed to sync schema for '{class_name}'.")
                 
             full_view_name = f"full_view_{safe_table_name}"
@@ -2672,10 +2692,11 @@ class MainWindow(QWidget):
         context = {'get_objects': local_get_objects, 'pd': pd}
         
         try:
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(f"--- Running Module: {mname} at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
+            # Append (don't truncate) so each run keeps the previous output as history.
+            with open(out_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n--- Running Module: {mname} at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
                 with redirect_stdout(f), redirect_stderr(f): exec(code, context)
-            QMessageBox.information(self, "Success", f"Script '{mname}' executed successfully.\nOutput saved to:\n{out_path}")
+            QMessageBox.information(self, "Success", f"Script '{mname}' executed successfully.\nOutput appended to:\n{out_path}")
         except Exception as e:
             with open(out_path, 'a', encoding='utf-8') as f:
                 f.write("\n\n--- RUNTIME ERROR ---\n")

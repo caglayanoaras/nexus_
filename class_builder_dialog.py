@@ -2,6 +2,8 @@ import sys
 import sqlite3
 import os
 import re
+import ast
+import datetime
 import uuid
 import shutil
 import qtawesome as qta
@@ -32,6 +34,84 @@ def qid(name):
     """Safely quote identifiers for SQLite."""
     if name is None: return ""
     return f"[{str(name).replace(']', ']]')}]"
+
+# ==========================================
+# VALUE TYPING (shared helpers)
+# ==========================================
+_TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
+
+
+def parse_boolean(val):
+    """Interpret common truthy/falsy inputs as 1/0. Raise ValueError otherwise.
+
+    Accepts 1/0, true/false, yes/no, y/n, t/f, on/off (case-insensitive) and the
+    numeric literals 0 and 1. Used by both import parsing and type conversion so a
+    human-filled template can say 'Yes' instead of only '1'.
+    """
+    if val is None:
+        raise ValueError("empty")
+    s = str(val).strip().lower()
+    if s in _TRUE_STRINGS:
+        return 1
+    if s in _FALSE_STRINGS:
+        return 0
+    f = float(s)  # raises ValueError for non-numeric text
+    i = int(f)
+    if f == i and i in (0, 1):
+        return i
+    raise ValueError(f"not a boolean: {val}")
+
+
+def storage_class_for(app_type):
+    """The SQLite storage class an app type maps to (mirrors sync_physical_table)."""
+    if app_type in ("int", "boolean"):
+        return "INTEGER"
+    if app_type == "float":
+        return "REAL"
+    return "TEXT"
+
+
+def coerce_value_for_type(val, app_type, options=None, matrix_count=None):
+    """Validate/convert a single stored value to an app type.
+
+    Returns (ok, coerced_value). Blank/None is always (True, None). When ok is
+    False the value is incompatible and the caller should clear it. Used when an
+    attribute's type changes but its storage class does not (e.g. string->date,
+    list->matrix, int->boolean), where sync_physical_table would not otherwise
+    revalidate the existing data.
+    """
+    if val is None or str(val).strip() == "":
+        return True, None
+    s = str(val).strip()
+    try:
+        if app_type == "boolean":
+            return True, parse_boolean(s)
+        if app_type == "int":
+            return True, int(float(s))
+        if app_type == "float":
+            return True, float(s)
+        if app_type == "date":
+            datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            return True, s
+        if app_type in ("list", "matrix"):
+            parsed = ast.literal_eval(s)
+            if not isinstance(parsed, list):
+                return False, None
+            if app_type == "matrix":
+                if matrix_count is not None and len(parsed) != matrix_count:
+                    return False, None
+                if any(not isinstance(inner, list) for inner in parsed):
+                    return False, None
+            return True, str(parsed)
+        if app_type == "discrete":
+            if options is not None and s not in options:
+                return False, None
+            return True, s
+        # string / long string / look-through and anything else: keep as text
+        return True, s
+    except (ValueError, SyntaxError, TypeError):
+        return False, None
 
 # ==========================================
 # FILE ATTACHMENTS (shared helpers)
@@ -969,13 +1049,22 @@ class ClassBuilderDialog(QDialog):
         # A look-through resolves its values through a relationship's junction table, so it
         # is only valid if this class actually has a relationship to the referenced class.
         # Validate against the relationships currently in the editor (they save together).
+        # Two relationships from this class to the SAME target class would resolve to one
+        # junction table (named source->target) and silently collide. Reject the duplicate.
         rel_targets_safe = set()
         for i in range(self.relationships_layout.count()):
             widget = self.relationships_layout.itemAt(i).widget()
             if isinstance(widget, RelationshipRow):
                 tgt = widget.target_combo.currentText().strip()
                 if tgt:
-                    rel_targets_safe.add(sanitize_name(tgt))
+                    safe_tgt = sanitize_name(tgt)
+                    if safe_tgt in rel_targets_safe:
+                        QMessageBox.warning(self, "Duplicate Relationship",
+                            f"This class already has a relationship to '{tgt}'.\n\n"
+                            "Multiple relationships to the same target class are not supported "
+                            "(they would share one link table). Please remove the duplicate.")
+                        return
+                    rel_targets_safe.add(safe_tgt)
 
         for i in range(self.attributes_layout.count()):
             widget = self.attributes_layout.itemAt(i).widget()
@@ -983,7 +1072,7 @@ class ClassBuilderDialog(QDialog):
                 lookup = widget.lookup_input.currentText().strip()
                 if not lookup:
                     continue  # empty look-through renders as NULL; nothing to validate
-                parts = lookup.split('.')
+                parts = lookup.split('.', 1)
                 if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
                     QMessageBox.warning(self, "Invalid Look-Through",
                         f"The look-through '{lookup}' is malformed.\n\nExpected the form 'TargetClass.Attribute'.")
@@ -1015,7 +1104,7 @@ class ClassBuilderDialog(QDialog):
                     if old_class_name != name:
                         cur.execute("SELECT id, lookup_query FROM attributes WHERE data_type = 'look-through' AND lookup_query LIKE ?", (f"{old_class_name}.%",))
                         for a_id, l_query in cur.fetchall():
-                            parts = l_query.split('.')
+                            parts = l_query.split('.', 1)
                             if len(parts) == 2 and parts[0] == old_class_name:
                                 new_query = f"{name}.{parts[1]}"
                                 cur.execute("UPDATE attributes SET lookup_query = ? WHERE id = ?", (new_query, a_id))
@@ -1045,9 +1134,11 @@ class ClassBuilderDialog(QDialog):
                             if "no such table" not in str(e).lower():
                                 QMessageBox.warning(self, "Database Warning", f"Could not rename physical table/junctions: {e}")
 
-                cur.execute("SELECT id, name FROM attributes WHERE class_id = ?", (self.current_class_id,))
-                old_attrs = {row[0]: row[1] for row in cur.fetchall()}
+                cur.execute("SELECT id, name, data_type FROM attributes WHERE class_id = ?", (self.current_class_id,))
+                old_attrs = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
                 processed_attrs = []
+                column_renames = []  # (attr_id, old_safe, new_safe) applied two-phase after the loop
+                type_coercions = []  # (safe_col, new_type, options, matrix_count) for same-storage type changes
 
                 for i in range(self.attributes_layout.count()):
                     widget = self.attributes_layout.itemAt(i).widget()
@@ -1071,17 +1162,30 @@ class ClassBuilderDialog(QDialog):
                             lookup_query = ""
                         
                         if widget.attr_id and widget.attr_id in old_attrs:
-                            old_attr_name = old_attrs[widget.attr_id]
+                            old_attr_name, old_attr_type = old_attrs[widget.attr_id]
                             old_safe_attr = sanitize_name(old_attr_name)
                             new_safe_attr = sanitize_name(attr_name)
-                            
+
+                            # Defer the physical column rename: doing it inline breaks when two
+                            # attributes swap names (RENAME A->B collides with the existing B).
                             if old_safe_attr != new_safe_attr:
-                                try:
-                                    cur.execute(f"ALTER TABLE {qid(table_name)} RENAME COLUMN {qid(old_safe_attr)} TO {qid(new_safe_attr)}")
-                                except sqlite3.OperationalError as e:
-                                    if "no such column" not in str(e).lower() and "no such table" not in str(e).lower():
-                                        QMessageBox.warning(self, "Database Warning", f"Could not rename physical column '{old_attr_name}': {e}")
-                                        
+                                column_renames.append((widget.attr_id, old_safe_attr, new_safe_attr))
+
+                            # Type changed but storage class did not (string->date, list->matrix,
+                            # int->boolean, …): sync_physical_table won't revalidate the data, so
+                            # schedule a conversion pass on the (post-rename) column.
+                            if old_attr_type != attr_type and storage_class_for(old_attr_type) == storage_class_for(attr_type):
+                                coerce_options = None
+                                if attr_type == "discrete":
+                                    coerce_d_id = widget.discrete_combo.currentData()
+                                    if coerce_d_id is not None:
+                                        coerce_options = {r[0] for r in cur.execute(
+                                            "SELECT value FROM discrete_options WHERE type_id = ?", (coerce_d_id,)).fetchall()}
+                                    else:
+                                        coerce_options = set()
+                                coerce_mcount = len(widget.matrix_cols) if attr_type == "matrix" else None
+                                type_coercions.append((new_safe_attr, attr_type, coerce_options, coerce_mcount))
+
                             if old_attr_name != attr_name:
                                 old_lookup = f"{name}.{old_attr_name}" 
                                 new_lookup = f"{name}.{attr_name}"
@@ -1111,6 +1215,53 @@ class ClassBuilderDialog(QDialog):
 
                 for d_id in set(old_attrs.keys()) - set(processed_attrs):
                     cur.execute("DELETE FROM attributes WHERE id = ?", (d_id,))
+
+                # --- Physical column renames, two-phase so name swaps/cycles can't collide ---
+                if column_renames:
+                    staged = []  # (tmp_name, final_safe) that reached phase 1
+                    for aid, old_safe, new_safe in column_renames:
+                        # sanitize_name never yields a leading underscore, so this temp can't
+                        # clash with a real column.
+                        tmp = f"__rntmp_{aid}"
+                        try:
+                            cur.execute(f"ALTER TABLE {qid(table_name)} RENAME COLUMN {qid(old_safe)} TO {qid(tmp)}")
+                            staged.append((tmp, new_safe))
+                        except sqlite3.OperationalError as e:
+                            if "no such column" not in str(e).lower() and "no such table" not in str(e).lower():
+                                QMessageBox.warning(self, "Database Warning", f"Could not rename physical column '{old_safe}': {e}")
+                    for tmp, new_safe in staged:
+                        try:
+                            cur.execute(f"ALTER TABLE {qid(table_name)} RENAME COLUMN {qid(tmp)} TO {qid(new_safe)}")
+                        except sqlite3.OperationalError as e:
+                            QMessageBox.warning(self, "Database Warning", f"Could not finalize rename to '{new_safe}': {e}")
+
+                # --- Same-storage type changes: convert existing values, clearing incompatibles ---
+                if type_coercions:
+                    pending_updates = []  # (safe_col, row_id, new_value)
+                    coerce_failures = 0
+                    for safe_col, new_type, options, mcount in type_coercions:
+                        try:
+                            data_rows = cur.execute(
+                                f"SELECT id, {qid(safe_col)} FROM {qid(table_name)} WHERE {qid(safe_col)} IS NOT NULL").fetchall()
+                        except sqlite3.OperationalError:
+                            continue  # column not materialized yet; sync will create it fresh
+                        for row_id, v in data_rows:
+                            ok, cv = coerce_value_for_type(v, new_type, options, mcount)
+                            if not ok:
+                                coerce_failures += 1
+                                pending_updates.append((safe_col, row_id, None))
+                            elif cv is None or str(cv) != str(v):
+                                pending_updates.append((safe_col, row_id, cv))
+                    if coerce_failures:
+                        reply = QMessageBox.question(self, "Data Type Conversion",
+                            f"{coerce_failures} existing value(s) are not compatible with the new type "
+                            "and will be cleared (set to empty).\n\nContinue?",
+                            QMessageBox.Yes | QMessageBox.No)
+                        if reply != QMessageBox.Yes:
+                            conn.rollback()
+                            return
+                    for safe_col, row_id, nv in pending_updates:
+                        cur.execute(f"UPDATE {qid(table_name)} SET {qid(safe_col)} = ? WHERE id = ?", (nv, row_id))
 
                 cur.execute("SELECT id FROM relationships WHERE source_class = ?", (self.current_class_id,))
                 old_rels = {row[0] for row in cur.fetchall()}
