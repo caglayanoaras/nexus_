@@ -1,0 +1,77 @@
+# ============================================================
+#  STOK DURUMU  —  Depoda ne var?  (metin raporu)
+#  Kalan = Girenler - Cikanlar + Iade Edilenler
+# ============================================================
+import sqlite3, datetime
+from PySide6.QtCore import QSettings
+
+# --- Turkce sinif adlarini otomatik bul (elle yazmaya gerek yok) ---
+DB = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+_names = [n for (n,) in sqlite3.connect(DB).execute("SELECT name FROM classes").fetchall()]
+
+def _find(*keys):
+    for n in _names:
+        if any(k in n.lower() for k in keys):
+            return n
+    raise ValueError(f"Sinif bulunamadi {keys}. Mevcut: {_names}")
+
+def pick(df, *keys):
+    """Kolon adini anahtar kelimeyle bul (yazim/harf farklarina dayanikli)."""
+    for c in df.columns:
+        if all(k in str(c).lower() for k in keys):
+            return c
+    return None
+
+def normalize(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim", "Miktar"])
+    out = pd.DataFrame(index=df.index)
+    out["Malzeme"]  = df.get(pick(df, "malzeme", "ad"), "")
+    out["Batch"]    = df.get(pick(df, "batch"), "")
+    out["Ambalaj"]  = df.get(pick(df, "ambalaj"), "")
+    out["Lokasyon"] = df.get(pick(df, "lokasyon"), "")
+    out["Birim"]    = df.get(pick(df, "birim"), "")
+    out["Miktar"]   = pd.to_numeric(df.get(pick(df, "miktar"), 0), errors="coerce").fillna(0.0)
+    for k in ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]:
+        out[k] = out[k].fillna("").astype(str)
+    return out
+
+KEYS = ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]
+
+def total(df):
+    n = normalize(df)
+    return n.groupby(KEYS)["Miktar"].sum() if len(n) else pd.Series(dtype="float64")
+
+g = total(get_objects(_find("giren")))
+c = total(get_objects(_find("kan")))    # cikanlar
+i = total(get_objects(_find("ade")))    # iade edilenler
+
+allkeys = g.index.union(c.index).union(i.index)
+rows = []
+for key in allkeys:
+    malzeme, batch, ambalaj, lokasyon, birim = key
+    gi, co, ia = float(g.get(key, 0)), float(c.get(key, 0)), float(i.get(key, 0))
+    rows.append([malzeme, batch, ambalaj, lokasyon, birim, gi, co, ia, gi - co + ia])
+
+stok = pd.DataFrame(rows, columns=["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim",
+                                   "Giriş", "Çıkan", "İade", "Kalan"])
+stok = stok.sort_values(["Malzeme", "Batch", "Ambalaj"]).reset_index(drop=True)
+
+print("=" * 78)
+print("DEPO STOK DURUMU   -   " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+print("=" * 78)
+if len(stok) == 0:
+    print("Kayit yok.")
+else:
+    print("\n--- Kalem bazinda (batch / ambalaj) ---")
+    print(stok.to_string(index=False))
+
+    print("\n--- Malzeme bazinda toplam kalan ---")
+    ozet = stok.groupby(["Malzeme", "Birim"])["Kalan"].sum().reset_index()
+    print(ozet.to_string(index=False))
+
+    neg = stok[stok["Kalan"] < 0]
+    if len(neg):
+        print("\n*** DİKKAT: negatif kalan (çıkış > giriş) - veri hatası olabilir ***")
+        print(neg.to_string(index=False))
+print("\n(rapor sonu)\n")

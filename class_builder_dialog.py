@@ -1,246 +1,20 @@
-import sys
+"""Schema-definition dialogs: attribute / relationship / discrete-option rows
+and the Class Builder and Discrete Type Builder. Foundation helpers live in core."""
 import sqlite3
-import os
-import re
-import ast
-import datetime
-import uuid
-import shutil
 import qtawesome as qta
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QListWidget, QPushButton, QLineEdit, QLabel, QTableView, 
-    QHeaderView, QMessageBox, QFileDialog, QListWidgetItem, QDialog,
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QListWidget, QPushButton, QLineEdit, QLabel,
+    QMessageBox, QFileDialog, QListWidgetItem, QDialog,
     QSplitter, QScrollArea, QComboBox, QInputDialog, QCheckBox,
     QTreeWidget, QTreeWidgetItem
 )
-from PySide6.QtGui import QIcon
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 
-DB_NAME = "class_manager.db"
-
-def get_app_icon():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    return QIcon(os.path.join(base_dir, "resources", "app_image.ico"))
-
-def sanitize_name(name):
-    if not name: return "unnamed"
-    safe = re.sub(r'[^\w]', '_', str(name)).lower()
-    safe = re.sub(r'_+', '_', safe).strip('_')
-    if safe and safe[0].isdigit(): safe = "n_" + safe
-    return safe if safe else "unnamed"
-
-def qid(name):
-    """Safely quote identifiers for SQLite."""
-    if name is None: return ""
-    return f"[{str(name).replace(']', ']]')}]"
-
-# ==========================================
-# VALUE TYPING (shared helpers)
-# ==========================================
-_TRUE_STRINGS = {"1", "true", "t", "yes", "y", "on"}
-_FALSE_STRINGS = {"0", "false", "f", "no", "n", "off"}
-
-
-def parse_boolean(val):
-    """Interpret common truthy/falsy inputs as 1/0. Raise ValueError otherwise.
-
-    Accepts 1/0, true/false, yes/no, y/n, t/f, on/off (case-insensitive) and the
-    numeric literals 0 and 1. Used by both import parsing and type conversion so a
-    human-filled template can say 'Yes' instead of only '1'.
-    """
-    if val is None:
-        raise ValueError("empty")
-    s = str(val).strip().lower()
-    if s in _TRUE_STRINGS:
-        return 1
-    if s in _FALSE_STRINGS:
-        return 0
-    f = float(s)  # raises ValueError for non-numeric text
-    i = int(f)
-    if f == i and i in (0, 1):
-        return i
-    raise ValueError(f"not a boolean: {val}")
-
-
-def storage_class_for(app_type):
-    """The SQLite storage class an app type maps to (mirrors sync_physical_table)."""
-    if app_type in ("int", "boolean"):
-        return "INTEGER"
-    if app_type == "float":
-        return "REAL"
-    return "TEXT"
-
-
-def coerce_value_for_type(val, app_type, options=None, matrix_count=None):
-    """Validate/convert a single stored value to an app type.
-
-    Returns (ok, coerced_value). Blank/None is always (True, None). When ok is
-    False the value is incompatible and the caller should clear it. Used when an
-    attribute's type changes but its storage class does not (e.g. string->date,
-    list->matrix, int->boolean), where sync_physical_table would not otherwise
-    revalidate the existing data.
-    """
-    if val is None or str(val).strip() == "":
-        return True, None
-    s = str(val).strip()
-    try:
-        if app_type == "boolean":
-            return True, parse_boolean(s)
-        if app_type == "int":
-            return True, int(float(s))
-        if app_type == "float":
-            return True, float(s)
-        if app_type == "date":
-            datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            return True, s
-        if app_type in ("list", "matrix"):
-            parsed = ast.literal_eval(s)
-            if not isinstance(parsed, list):
-                return False, None
-            if app_type == "matrix":
-                if matrix_count is not None and len(parsed) != matrix_count:
-                    return False, None
-                if any(not isinstance(inner, list) for inner in parsed):
-                    return False, None
-            return True, str(parsed)
-        if app_type == "discrete":
-            if options is not None and s not in options:
-                return False, None
-            return True, s
-        # string / long string / look-through and anything else: keep as text
-        return True, s
-    except (ValueError, SyntaxError, TypeError):
-        return False, None
-
-# ==========================================
-# FILE ATTACHMENTS (shared helpers)
-# ==========================================
-# A "file" attribute stores a reference string of the form  <uuid32hex>__<original name>
-# which is ALSO the file's name on disk inside the per-database files folder.
-# The generated views expose only the display part (substr from char 35), so the table,
-# look-throughs and relationship titles all show the clean filename automatically.
-FILES_SUBDIR_SUFFIX = "_files"
-FILE_PREFIX_LEN = 34  # uuid4().hex (32) + "__"
-
-
-def sanitize_filename(name):
-    name = os.path.basename(str(name)).strip()
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
-    return name or "file"
-
-
-def make_stored_filename(original):
-    """Build a collision-proof on-disk/reference name that keeps the original for display."""
-    return f"{uuid.uuid4().hex}__{sanitize_filename(original)}"
-
-
-def display_file_name(stored_value):
-    if not stored_value:
-        return ""
-    return str(stored_value)[FILE_PREFIX_LEN:]
-
-
-def files_dir_for(db_path, create=False):
-    if not db_path:
-        return None
-    base = os.path.dirname(os.path.abspath(db_path))
-    stem = os.path.splitext(os.path.basename(db_path))[0]
-    d = os.path.join(base, stem + FILES_SUBDIR_SUFFIX)
-    if create:
-        os.makedirs(d, exist_ok=True)
-    return d
-
-
-def resolve_file_path(db_path, stored_value):
-    d = files_dir_for(db_path, create=False)
-    if not d or not stored_value:
-        return None
-    return os.path.join(d, str(stored_value))
-
-
-def trash_stored_file(db_path, stored_value):
-    """Move a stored file into the _trash folder (best-effort, recoverable)."""
-    if not stored_value:
-        return
-    src = resolve_file_path(db_path, stored_value)
-    if not src or not os.path.exists(src):
-        return
-    try:
-        trash = os.path.join(files_dir_for(db_path, create=True), "_trash")
-        os.makedirs(trash, exist_ok=True)
-        dest = os.path.join(trash, str(stored_value))
-        if os.path.exists(dest):
-            dest = os.path.join(trash, f"{uuid.uuid4().hex[:8]}_{stored_value}")
-        shutil.move(src, dest)
-    except OSError:
-        pass
-
-def init_db(db_path=DB_NAME):
-    with sqlite3.connect(db_path) as conn:
-        # WAL lets readers (the Qt table view) and the writer (sqlite3 DDL/DML)
-        # work on the same file concurrently without "database is locked" errors.
-        # This is a persistent property of the file, so setting it once is enough.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys = 1")
-        cursor = conn.cursor()
-        cursor.executescript("""
-            CREATE TABLE IF NOT EXISTS classes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS attributes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                class_id INTEGER,
-                name TEXT NOT NULL,
-                data_type TEXT NOT NULL,
-                row_order INTEGER DEFAULT 0,
-                show_in_table INTEGER DEFAULT 1,
-                is_title INTEGER DEFAULT 0,
-                is_unique INTEGER DEFAULT 0,
-                is_required INTEGER DEFAULT 0,
-                lookup_query TEXT DEFAULT '',
-                FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS matrix_columns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attribute_id INTEGER,
-                column_name TEXT NOT NULL,
-                column_index INTEGER NOT NULL,
-                FOREIGN KEY(attribute_id) REFERENCES attributes(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS relationships (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_class INTEGER,
-                target_class INTEGER,
-                rel_type TEXT NOT NULL,
-                row_order INTEGER DEFAULT 0,
-                show_in_table INTEGER DEFAULT 1,
-                show_in_base INTEGER DEFAULT 1,
-                show_in_target INTEGER DEFAULT 1,
-                FOREIGN KEY(source_class) REFERENCES classes(id) ON DELETE CASCADE,
-                FOREIGN KEY(target_class) REFERENCES classes(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS modules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT DEFAULT '',
-                code TEXT DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS discrete_types (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-            CREATE TABLE IF NOT EXISTS discrete_options (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type_id INTEGER,
-                value TEXT NOT NULL,
-                row_order INTEGER DEFAULT 0,
-                FOREIGN KEY(type_id) REFERENCES discrete_types(id) ON DELETE CASCADE
-            );
-        """)
-        conn.commit()
+from core import (
+    get_app_icon, get_db_path, init_db, sanitize_name, qid,
+    storage_class_for, coerce_value_for_type, trash_stored_file,
+)
 
 
 class ReorderableRow(QWidget):
@@ -408,7 +182,10 @@ class RelationshipRow(ReorderableRow):
         
         self.show_target_cb = QCheckBox("Show in Target")
         self.show_target_cb.setChecked(True)
-        
+
+        self.req_cb = QCheckBox("Req.")
+        self.req_cb.setToolTip("Required: an object must link at least one target to be saved.")
+
         self.delete_btn = QPushButton()
         self.delete_btn.setIcon(qta.icon('fa5s.times', color='#ff4c4c'))
         self.delete_btn.setFixedWidth(30)
@@ -421,15 +198,17 @@ class RelationshipRow(ReorderableRow):
         layout.addWidget(self.type_combo)
         layout.addWidget(self.show_base_cb)
         layout.addWidget(self.show_target_cb)
+        layout.addWidget(self.req_cb)
         layout.addWidget(self.delete_btn)
 
         if rel_data:
             idx = self.target_combo.findData(rel_data['target_class'])
-            if idx >= 0: 
+            if idx >= 0:
                 self.target_combo.setCurrentIndex(idx)
             self.type_combo.setCurrentText(rel_data['type'])
             self.show_base_cb.setChecked(bool(rel_data.get('show_in_base', 1)))
             self.show_target_cb.setChecked(bool(rel_data.get('show_in_target', 1)))
+            self.req_cb.setChecked(bool(rel_data.get('is_required', 0)))
 
 
 class DiscreteOptionRow(ReorderableRow):
@@ -475,9 +254,7 @@ class DiscreteTypeBuilderDialog(QDialog):
         self.setWindowIcon(get_app_icon())
         self.resize(820, 560)
 
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        path = settings.value("db_path", "").strip() or DB_NAME
-        self.db_path = path
+        self.db_path = get_db_path()
         init_db(self.db_path)
         self.current_type_id = None
 
@@ -727,12 +504,7 @@ class ClassBuilderDialog(QDialog):
         self.setWindowIcon(get_app_icon())
         self.resize(1000, 600)
         
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        path = settings.value("db_path", "").strip()
-        if not path:
-            path = DB_NAME 
-            
-        self.db_path = path
+        self.db_path = get_db_path()
         init_db(self.db_path)
         self.current_class_id = None
 
@@ -952,10 +724,10 @@ class ClassBuilderDialog(QDialog):
                 }
                 self.attributes_layout.addWidget(AttributeRow(self.attributes_layout, valid_lookups, attr_data, valid_discrete_types=valid_discrete_types))
 
-            cur.execute("SELECT id, target_class, rel_type, show_in_base, show_in_target FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
-            for rel_id, target, rel_type, show_in_base, show_in_target in cur.fetchall():
+            cur.execute("SELECT id, target_class, rel_type, show_in_base, show_in_target, is_required FROM relationships WHERE source_class = ? ORDER BY row_order ASC", (self.current_class_id,))
+            for rel_id, target, rel_type, show_in_base, show_in_target, is_required in cur.fetchall():
                 valid_classes = [(c[0], c[1]) for c in self.get_all_classes() if c[0] != self.current_class_id]
-                self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_base': show_in_base, 'show_in_target': show_in_target}))
+                self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_base': show_in_base, 'show_in_target': show_in_target, 'is_required': is_required}))
 
     def check_for_circular_dependencies(self, new_class_name):
         with sqlite3.connect(self.db_path) as conn:
@@ -1274,20 +1046,21 @@ class ClassBuilderDialog(QDialog):
                         rel_type = widget.type_combo.currentText()
                         show_in_base = 1 if widget.show_base_cb.isChecked() else 0
                         show_in_target = 1 if widget.show_target_cb.isChecked() else 0
-                        
+                        is_required = 1 if widget.req_cb.isChecked() else 0
+
                         if target_id is not None:
                             if widget.rel_id and widget.rel_id in old_rels:
                                 cur.execute("""
-                                    UPDATE relationships 
-                                    SET target_class=?, rel_type=?, row_order=?, show_in_base=?, show_in_target=? 
+                                    UPDATE relationships
+                                    SET target_class=?, rel_type=?, row_order=?, show_in_base=?, show_in_target=?, is_required=?
                                     WHERE id=?
-                                """, (target_id, rel_type, i, show_in_base, show_in_target, widget.rel_id))
+                                """, (target_id, rel_type, i, show_in_base, show_in_target, is_required, widget.rel_id))
                                 processed_rels.append(widget.rel_id)
                             else:
                                 cur.execute("""
-                                    INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_base, show_in_target) 
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                """, (self.current_class_id, target_id, rel_type, i, show_in_base, show_in_target))
+                                    INSERT INTO relationships (source_class, target_class, rel_type, row_order, show_in_base, show_in_target, is_required)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """, (self.current_class_id, target_id, rel_type, i, show_in_base, show_in_target, is_required))
                                 widget.rel_id = cur.lastrowid
                                 processed_rels.append(widget.rel_id)
 

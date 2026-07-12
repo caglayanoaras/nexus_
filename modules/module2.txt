@@ -1,0 +1,116 @@
+# ============================================================
+#  STOK PDF RAPORU  (PyMuPDF / fitz)
+#  Cikti: veritabaninin yaninda  stok_raporu_<tarih>.pdf
+# ============================================================
+import os, sqlite3, datetime
+import fitz
+from PySide6.QtCore import QSettings
+
+DB = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+_names = [n for (n,) in sqlite3.connect(DB).execute("SELECT name FROM classes").fetchall()]
+
+def _find(*keys):
+    for n in _names:
+        if any(k in n.lower() for k in keys):
+            return n
+    raise ValueError(f"Sinif bulunamadi {keys}. Mevcut: {_names}")
+
+def pick(df, *keys):
+    for c in df.columns:
+        if all(k in str(c).lower() for k in keys):
+            return c
+    return None
+
+def normalize(df):
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim", "Miktar"])
+    out = pd.DataFrame(index=df.index)
+    out["Malzeme"]  = df.get(pick(df, "malzeme", "ad"), "")
+    out["Batch"]    = df.get(pick(df, "batch"), "")
+    out["Ambalaj"]  = df.get(pick(df, "ambalaj"), "")
+    out["Lokasyon"] = df.get(pick(df, "lokasyon"), "")
+    out["Birim"]    = df.get(pick(df, "birim"), "")
+    out["Miktar"]   = pd.to_numeric(df.get(pick(df, "miktar"), 0), errors="coerce").fillna(0.0)
+    for k in ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]:
+        out[k] = out[k].fillna("").astype(str)
+    return out
+
+KEYS = ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]
+
+def total(df):
+    n = normalize(df)
+    return n.groupby(KEYS)["Miktar"].sum() if len(n) else pd.Series(dtype="float64")
+
+g = total(get_objects(_find("giren")))
+c = total(get_objects(_find("kan")))
+i = total(get_objects(_find("ade")))
+
+allkeys = g.index.union(c.index).union(i.index)
+rows = []
+for key in allkeys:
+    m, b, a, l, u = key
+    gi, co, ia = float(g.get(key, 0)), float(c.get(key, 0)), float(i.get(key, 0))
+    rows.append([m, b, a, l, gi, co, ia, gi - co + ia, u])
+rows.sort(key=lambda r: (r[0], r[1], r[2]))
+
+# ---------------- PDF cizimi ----------------
+try:
+    FONT = fitz.Font(fontfile=r"C:\Windows\Fonts\arial.ttf")   # Turkce karakterler icin
+except Exception:
+    FONT = fitz.Font("helv")
+
+PAGE_W, PAGE_H, M = 842, 595, 32                               # A4 yatay
+cols = [("Malzeme", 190, "l"), ("Batch", 85, "l"), ("Ambalaj", 85, "l"),
+        ("Lokasyon", 100, "l"), ("Giriş", 62, "r"), ("Çıkan", 62, "r"),
+        ("İade", 55, "r"), ("Kalan", 64, "r"), ("Birim", 44, "l")]
+xs, x = [], M
+for _n, w, al in cols:
+    xs.append((x, w, al)); x += w
+RIGHT = x
+
+def fmt(v):
+    if isinstance(v, float):
+        return str(int(v)) if v == int(v) else f"{v:.2f}"
+    return "" if v is None else str(v)
+
+doc = fitz.open()
+
+def start_page(no):
+    p = doc.new_page(width=PAGE_W, height=PAGE_H)
+    tw = fitz.TextWriter(p.rect)
+    tw.append((M, M + 4), "DEPO STOK RAPORU", font=FONT, fontsize=16)
+    tw.append((M, M + 22), datetime.datetime.now().strftime("Tarih: %Y-%m-%d %H:%M") + f"     Sayfa {no}",
+              font=FONT, fontsize=9)
+    yy = M + 46
+    for (name, _w, _al), (cx, cw, al) in zip(cols, xs):
+        tw.append((cx + 2, yy), name, font=FONT, fontsize=9)
+    return p, tw, yy
+
+def cells(tw, vals, yy, size=9):
+    for val, (cx, cw, al) in zip(vals, xs):
+        s = fmt(val)
+        px = (cx + cw - 4 - FONT.text_length(s, fontsize=size)) if al == "r" else (cx + 2)
+        tw.append((px, yy), s, font=FONT, fontsize=size)
+
+no = 1
+p, tw, y = start_page(no)
+p.draw_line((M, y + 4), (RIGHT, y + 4))
+y += 18
+BOTTOM = PAGE_H - M
+if not rows:
+    tw.append((M, y), "Kayıt yok.", font=FONT, fontsize=11)
+for r in rows:
+    if y > BOTTOM:
+        tw.write_text(p)
+        no += 1
+        p, tw, y = start_page(no)
+        p.draw_line((M, y + 4), (RIGHT, y + 4)); y += 18
+    cells(tw, r, y)
+    y += 15
+tw.write_text(p)
+
+out_dir = os.path.dirname(os.path.abspath(DB)) if DB else os.path.expanduser("~")
+out_path = os.path.join(out_dir, "stok_raporu_" + datetime.datetime.now().strftime("%Y%m%d_%H%M") + ".pdf")
+doc.save(out_path)
+doc.close()
+print("PDF olusturuldu:", out_path)
