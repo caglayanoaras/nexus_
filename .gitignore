@@ -3,3 +3,6 @@
 \.claude
 __pycache__/
 *.db
+resources/nexus_config.json
+tests/
+images/

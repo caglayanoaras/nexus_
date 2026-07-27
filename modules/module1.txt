@@ -1,77 +1,254 @@
 # ============================================================
-#  STOK DURUMU  —  Depoda ne var?  (metin raporu)
-#  Kalan = Girenler - Cikanlar + Iade Edilenler
+#  STOK EXCEL RAPORU  (openpyxl)
+#  Cikti: veritabaninin yaninda  stok_raporu_<tarih>.xlsx
+#
+#  1. sayfa "Stok Detay"      : Kalan > 0 olan kalemler (ambalaj/batch bazinda)
+#  2. sayfa "Malzeme Toplam"  : Malzeme bazinda toplam (birimler cevrilerek)
+#  3. sayfa "Tukenen"         : Kalan <= 0 olan kalemler
+#
+#  NOT: Bu dosyanin BIRIM AYARLARI ve hesaplama blogu module2 (PDF raporu) ile
+#  aynidir. Birinde degisiklik yaparsan digerine de kopyala.
 # ============================================================
-import sqlite3, datetime
-from PySide6.QtCore import QSettings
+import os, sqlite3, datetime
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from core import get_db_path
 
-# --- Turkce sinif adlarini otomatik bul (elle yazmaya gerek yok) ---
-DB = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+# ============================================================
+#  BIRIM AYARLARI  -  degistirmek istediginde SADECE burayi duzenle
+# ============================================================
+#  Soldaki yazim sekli veritabanindaki "Birim" degeriyle eslesir.
+#  Buyuk/kucuk harf ve Turkce karakter farki onemli degil ("KG" = "kg").
+#
+#      "yazim": (aile, taban birime carpan)
+#
+#  Taban birim  kutle icin GRAM, hacim icin MILILITRE'dir.
+UNITS = {
+    # --- kutle (taban: gram) ---
+    "kg":         ("kutle", 1000.0),
+    "kilogram":   ("kutle", 1000.0),
+    "kilo":       ("kutle", 1000.0),
+    "g":          ("kutle", 1.0),
+    "gr":         ("kutle", 1.0),
+    "gram":       ("kutle", 1.0),
+
+    # --- hacim (taban: mililitre) ---
+    "l":          ("hacim", 1000.0),
+    "lt":         ("hacim", 1000.0),
+    "litre":      ("hacim", 1000.0),
+    "liter":      ("hacim", 1000.0),
+    "ml":         ("hacim", 1.0),
+    "mililitre":  ("hacim", 1.0),
+    "mililiter":  ("hacim", 1.0),
+    "millilitre": ("hacim", 1.0),
+}
+
+#  Toplam sayfasinda her ailenin hangi birimde gosterilecegi.
+#      aile: (gosterilecek birim, taban birimden bolunecek sayi)
+#  Gram gostermek istersen:   "kutle": ("g", 1.0)
+DISPLAY = {
+    "kutle": ("kg", 1000.0),
+    "hacim": ("L",  1000.0),
+}
+# ============================================================
+
+
+DB = get_db_path()
 _names = [n for (n,) in sqlite3.connect(DB).execute("SELECT name FROM classes").fetchall()]
 
+# Turkce harfleri sadelestir: "İ".lower() Python'da i + birlesik nokta uretir,
+# bu yuzden duz .lower() ile "iade" araması "İade"yi bulamaz.
+_TR = str.maketrans({
+    "İ": "i", "I": "i", "ı": "i", "Ş": "s", "ş": "s", "Ğ": "g", "ğ": "g",
+    "Ü": "u", "ü": "u", "Ö": "o", "ö": "o", "Ç": "c", "ç": "c",
+})
+
+def _norm(s):
+    return str(s).translate(_TR).lower()
+
 def _find(*keys):
+    """Verilen kelimelerin HEPSINI iceren sinif adi.
+
+    Hepsi aranir cunku hem 'Hammadde Depo Girenler' hem 'Numune Depo Girenler'
+    var; tek kelime ile arama yanlis sinifi getirebilir.
+    """
     for n in _names:
-        if any(k in n.lower() for k in keys):
+        if all(k in _norm(n) for k in keys):
             return n
     raise ValueError(f"Sinif bulunamadi {keys}. Mevcut: {_names}")
 
 def pick(df, *keys):
     """Kolon adini anahtar kelimeyle bul (yazim/harf farklarina dayanikli)."""
     for c in df.columns:
-        if all(k in str(c).lower() for k in keys):
+        if all(k in _norm(c) for k in keys):
             return c
     return None
 
 def normalize(df):
+    cols = ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Laboratuvar", "Birim", "Miktar"]
     if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim", "Miktar"])
+        return pd.DataFrame(columns=cols)
     out = pd.DataFrame(index=df.index)
-    out["Malzeme"]  = df.get(pick(df, "malzeme", "ad"), "")
-    out["Batch"]    = df.get(pick(df, "batch"), "")
-    out["Ambalaj"]  = df.get(pick(df, "ambalaj"), "")
-    out["Lokasyon"] = df.get(pick(df, "lokasyon"), "")
-    out["Birim"]    = df.get(pick(df, "birim"), "")
-    out["Miktar"]   = pd.to_numeric(df.get(pick(df, "miktar"), 0), errors="coerce").fillna(0.0)
-    for k in ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]:
+    out["Malzeme"]     = df.get(pick(df, "malzeme", "ad"), "")
+    out["Batch"]       = df.get(pick(df, "batch"), "")
+    out["Ambalaj"]     = df.get(pick(df, "ambalaj"), "")
+    out["Lokasyon"]    = df.get(pick(df, "lokasyon"), "")
+    # Sinifa gore "Bulunudugu" / "Bulundugu" yazilmis; tek kelimeyle ariyoruz.
+    out["Laboratuvar"] = df.get(pick(df, "laboratuvar"), "")
+    out["Birim"]       = df.get(pick(df, "birim"), "")
+    out["Miktar"]      = pd.to_numeric(df.get(pick(df, "miktar"), 0), errors="coerce").fillna(0.0)
+    for k in cols[:-1]:
         out[k] = out[k].fillna("").astype(str)
     return out
 
-KEYS = ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim"]
+KEYS = ["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Laboratuvar", "Birim"]
 
 def total(df):
     n = normalize(df)
     return n.groupby(KEYS)["Miktar"].sum() if len(n) else pd.Series(dtype="float64")
 
-g = total(get_objects(_find("giren")))
-c = total(get_objects(_find("kan")))    # cikanlar
-i = total(get_objects(_find("ade")))    # iade edilenler
+df_giren = get_objects(_find("hammadde", "giren"))
+df_cikan = get_objects(_find("hammadde", "cikan"))
+df_iade  = get_objects(_find("hammadde", "ade"))
+
+g = total(df_giren)
+c = total(df_cikan)
+i = total(df_iade)
+
+# --- SKT yalnizca "Girenler" sinifinda var; anahtara gore esliyoruz.
+#     Ayni anahtarda birden fazla giris varsa en erken SKT gosterilir.
+skt_map = {}
+if df_giren is not None and len(df_giren):
+    n_g = normalize(df_giren)
+    skt_col = pick(df_giren, "skt")
+    if skt_col is not None:
+        n_g = n_g.assign(SKT=df_giren[skt_col])
+        for key, grp in n_g.groupby(KEYS):
+            vals = [str(v)[:10] for v in grp["SKT"].dropna() if str(v).strip()]
+            if vals:
+                skt_map[key] = min(vals)
 
 allkeys = g.index.union(c.index).union(i.index)
-rows = []
+
+records = []
 for key in allkeys:
-    malzeme, batch, ambalaj, lokasyon, birim = key
+    m, b, a, l, lab, u = key
     gi, co, ia = float(g.get(key, 0)), float(c.get(key, 0)), float(i.get(key, 0))
-    rows.append([malzeme, batch, ambalaj, lokasyon, birim, gi, co, ia, gi - co + ia])
+    records.append({
+        "malzeme": m, "batch": b, "ambalaj": a,
+        "lokasyon": f"{l}--{lab}" if lab else l,
+        "skt": skt_map.get(key, ""),
+        "giris": gi, "cikan": co, "iade": ia,
+        "kalan": gi - co + ia, "birim": u,
+    })
+records.sort(key=lambda r: (r["malzeme"], r["batch"], r["ambalaj"]))
 
-stok = pd.DataFrame(rows, columns=["Malzeme", "Batch", "Ambalaj", "Lokasyon", "Birim",
-                                   "Giriş", "Çıkan", "İade", "Kalan"])
-stok = stok.sort_values(["Malzeme", "Batch", "Ambalaj"]).reset_index(drop=True)
+stokta  = [r for r in records if r["kalan"] > 0]
+tukenen = [r for r in records if r["kalan"] <= 0]
 
-print("=" * 78)
-print("DEPO STOK DURUMU   -   " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-print("=" * 78)
-if len(stok) == 0:
-    print("Kayit yok.")
-else:
-    print("\n--- Kalem bazinda (batch / ambalaj) ---")
-    print(stok.to_string(index=False))
+# ---------------- Malzeme bazinda toplam ----------------
+# Yalnizca stoktaki kalemler toplanir.
+def unit_info(label):
+    key = _norm(label).strip().rstrip(".")
+    return UNITS.get(key, (None, None))
 
-    print("\n--- Malzeme bazinda toplam kalan ---")
-    ozet = stok.groupby(["Malzeme", "Birim"])["Kalan"].sum().reset_index()
-    print(ozet.to_string(index=False))
+totals, unknown_units = {}, set()
+for r in stokta:
+    malzeme, kalan, birim = r["malzeme"], r["kalan"], r["birim"]
+    family, factor = unit_info(birim)
+    if family is None:
+        unknown_units.add(birim)
+        bucket = ("?", birim.strip())
+        totals.setdefault(malzeme, {})[bucket] = totals.setdefault(malzeme, {}).get(bucket, 0.0) + kalan
+    else:
+        totals.setdefault(malzeme, {})[family] = totals.setdefault(malzeme, {}).get(family, 0.0) + kalan * factor
 
-    neg = stok[stok["Kalan"] < 0]
-    if len(neg):
-        print("\n*** DİKKAT: negatif kalan (çıkış > giriş) - veri hatası olabilir ***")
-        print(neg.to_string(index=False))
-print("\n(rapor sonu)\n")
+# Excel'de her satir tek birim tasir; boylece suzulebilir ve toplanabilir.
+summary = []
+for malzeme in sorted(totals):
+    for bucket, amount in sorted(totals[malzeme].items(), key=lambda kv: str(kv[0])):
+        if isinstance(bucket, tuple):
+            summary.append([malzeme, round(amount, 4), bucket[1]])
+        else:
+            unit_label, divisor = DISPLAY.get(bucket, (bucket, 1.0))
+            summary.append([malzeme, round(amount / divisor, 4), unit_label])
+
+# ---------------- Excel cizimi ----------------
+HDR_FILL = PatternFill("solid", fgColor="DDEBF7")
+HDR_FONT = Font(bold=True)
+WARN_FILL = PatternFill("solid", fgColor="FCE4E4")     # eksi bakiyeli satirlar
+
+DETAY_HDR = ["Malzeme", "Batch", "Ambalaj", "Lokasyon--Laboratuvar", "SKT",
+             "Giriş", "Çıkan", "İade", "Kalan", "Birim"]
+OZET_HDR  = ["Malzeme", "Toplam Kalan", "Birim"]
+
+def detay_row(r):
+    return [r["malzeme"], r["batch"], r["ambalaj"], r["lokasyon"], r["skt"],
+            r["giris"], r["cikan"], r["iade"], r["kalan"], r["birim"]]
+
+def write_sheet(ws, headers, rows, numeric_from=None, highlight_negative_col=None):
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = HDR_FONT
+        cell.fill = HDR_FILL
+        cell.alignment = Alignment(horizontal="center")
+    for row in rows:
+        ws.append(row)
+
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
+    ws.freeze_panes = "A2"
+
+    # sayisal sutunlara 2 haneli format
+    if numeric_from is not None:
+        for row in ws.iter_rows(min_row=2, min_col=numeric_from + 1, max_col=len(headers)):
+            for cell in row:
+                if isinstance(cell.value, float):
+                    cell.number_format = "#,##0.00"
+
+    # eksi bakiyeli satirlari isaretle
+    if highlight_negative_col is not None:
+        for r_i, row in enumerate(ws.iter_rows(min_row=2, max_col=len(headers)), start=2):
+            v = ws.cell(row=r_i, column=highlight_negative_col + 1).value
+            if isinstance(v, (int, float)) and v < 0:
+                for cell in row:
+                    cell.fill = WARN_FILL
+
+    # sutun genisligi
+    for ci, h in enumerate(headers, start=1):
+        longest = max([len(str(h))] + [len(str(r[ci - 1])) for r in rows]) if rows else len(str(h))
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(longest + 2, 9), 46)
+
+wb = openpyxl.Workbook()
+
+ws1 = wb.active
+ws1.title = "Stok Detay"
+write_sheet(ws1, DETAY_HDR, [detay_row(r) for r in stokta], numeric_from=5)
+
+ws2 = wb.create_sheet("Malzeme Toplam")
+write_sheet(ws2, OZET_HDR, summary, numeric_from=1)
+
+ws3 = wb.create_sheet("Tukenen")
+write_sheet(ws3, DETAY_HDR, [detay_row(r) for r in tukenen],
+            numeric_from=5, highlight_negative_col=8)
+
+out_dir = os.path.dirname(os.path.abspath(DB)) if DB else os.path.expanduser("~")
+out_path = os.path.join(out_dir, "stok_raporu_" + datetime.datetime.now().strftime("%Y%m%d_%H%M") + ".xlsx")
+wb.save(out_path)
+
+eksi = [r for r in tukenen if r["kalan"] < 0]
+print("Excel olusturuldu:", out_path)
+print(f"  Sayfa 'Stok Detay'     : {len(stokta)} kalem")
+print(f"  Sayfa 'Malzeme Toplam' : {len(summary)} satir")
+print(f"  Sayfa 'Tukenen'        : {len(tukenen)} kalem")
+if eksi:
+    print()
+    print(f"UYARI - {len(eksi)} kalemde EKSI bakiye var (cikan/iade kayitlari tutarsiz):")
+    for r in eksi:
+        print(f"   {r['malzeme']} / {r['batch']} / {r['ambalaj']}  ->  {r['kalan']} {r['birim']}")
+if unknown_units:
+    print()
+    print("UYARI - su birimler taninmadi, toplamda cevrilmeden birakildi:")
+    for u in sorted(unknown_units):
+        print(f"   '{u}'   ->  UNITS sozlugune ekleyebilirsin")

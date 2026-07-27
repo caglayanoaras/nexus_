@@ -19,13 +19,15 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QMenuBar, QMenu,
 )
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 from PySide6.QtSql import QSqlDatabase
 from PySide6.QtGui import QAction, QFont
 
 from core import (
     get_db_path, init_db, sync_physical_table, sanitize_name, qid, get_app_icon,
-    files_dir_for, trash_stored_file,
+    files_dir_for, trash_stored_file, set_db_path,
+    get_module_output_path, set_module_output_path, backup_database,
+    db_session, is_network_path, journal_mode, BUSY_TIMEOUT_MS,
 )
 from class_builder_dialog import ClassBuilderDialog, DiscreteTypeBuilderDialog
 from data_browser import DataBrowserPage
@@ -37,8 +39,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Database Settings")
         self.setWindowIcon(get_app_icon())
         self.resize(700, 250)
-        self.settings = QSettings("MyCompany", "DatabaseManagerApp")
-        
+
         main_layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -49,8 +50,9 @@ class SettingsDialog(QDialog):
 
         path_layout = QHBoxLayout()
         self.path_input = QLineEdit()
-        self.path_input.setText(self.settings.value("db_path", ""))
-        
+        # Show the resolved absolute path — the config may hold just "nexus.db".
+        self.path_input.setText(get_db_path())
+
         btn_browse = QPushButton(" Browse...")
         btn_browse.setIcon(qta.icon('fa5s.folder-open'))
         btn_browse.clicked.connect(self.browse_file)
@@ -76,15 +78,11 @@ class SettingsDialog(QDialog):
         
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit()
-        
-        db_path = self.settings.value("db_path", "")
-        if db_path and os.path.exists(os.path.dirname(db_path)):
-            default_out = os.path.join(os.path.dirname(db_path), "module_output.txt")
-        else:
-            default_out = os.path.join(os.path.expanduser("~"), "module_output.txt")
-            
-        self.output_input.setText(self.settings.value("module_output_path", default_out))
-        
+        # Same single source of truth the module runners use, so what this shows is
+        # exactly where a run will write.
+        self.output_input.setText(get_module_output_path())
+
+
         btn_browse_out = QPushButton(" Browse...")
         btn_browse_out.setIcon(qta.icon('fa5s.folder-open'))
         btn_browse_out.clicked.connect(self.browse_output_file)
@@ -116,11 +114,11 @@ class SettingsDialog(QDialog):
         path = self.path_input.text().strip()
         if not path: return
         if not os.path.exists(path): init_db(path)
-        self.settings.setValue("db_path", path)
+        set_db_path(path)
         QMessageBox.information(self, "Success", "Database path saved as default.")
-        
+
     def save_module_path(self):
-        self.settings.setValue("module_output_path", self.output_input.text().strip())
+        set_module_output_path(self.output_input.text().strip())
         QMessageBox.information(self, "Success", "Module output path saved.")
 
 
@@ -208,7 +206,7 @@ class ModuleBuilderDialog(QDialog):
         self.refresh_module_list()
 
     def get_all_modules(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT id, name, path FROM modules ORDER BY path ASC, name ASC")
             return cur.fetchall()
@@ -264,7 +262,7 @@ class ModuleBuilderDialog(QDialog):
         self.current_module_id = mid
         self.editor_widget.setEnabled(True)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT name, path, code FROM modules WHERE id = ?", (mid,))
             row = cur.fetchone()
@@ -284,7 +282,7 @@ class ModuleBuilderDialog(QDialog):
             return
             
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 if self.current_module_id is None:
                     cur.execute("INSERT INTO modules (name, path, code) VALUES (?, ?, ?)", (name, path_val, code))
@@ -302,7 +300,7 @@ class ModuleBuilderDialog(QDialog):
         if self.current_module_id is None: return
         reply = QMessageBox.question(self, "Delete", "Are you sure you want to delete this module?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("DELETE FROM modules WHERE id = ?", (self.current_module_id,))
                 conn.commit()
                 
@@ -315,7 +313,7 @@ class ModuleBuilderDialog(QDialog):
 
     def get_objects(self, class_name):
         if pd is None: raise ImportError("Pandas library is not installed.")
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT id FROM classes WHERE name = ?", (class_name,))
             row = cur.fetchone()
@@ -327,14 +325,13 @@ class ModuleBuilderDialog(QDialog):
         if not view_name: raise RuntimeError(f"Failed to sync schema for class '{class_name}'.")
             
         full_view_name = f"full_view_{safe_table_name}"
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             df = pd.read_sql_query(f"SELECT * FROM {qid(full_view_name)}", conn)
         return df
 
     def run_script(self):
         code = self.editor.toPlainText()
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
+        out_path = get_module_output_path()
         context = {'get_objects': self.get_objects, 'pd': pd}
 
         try:
@@ -438,6 +435,10 @@ class MainWindow(QWidget):
         db_menu.addAction(action_module)
 
         db_menu.addSeparator()
+        action_backup = QAction(qta.icon('fa5s.shield-alt'), " Backup Now...", self)
+        action_backup.triggered.connect(self.backup_now)
+        db_menu.addAction(action_backup)
+
         action_cleanup = QAction(qta.icon('fa5s.broom'), " Clean Up Unused Files", self)
         action_cleanup.triggered.connect(self.clean_unused_files)
         db_menu.addAction(action_cleanup)
@@ -448,11 +449,10 @@ class MainWindow(QWidget):
         doc_menu.addAction(action_api)
 
     def open_settings(self):
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        old_db = settings.value("db_path", "")
+        old_db = get_db_path()
         dialog = SettingsDialog(self)
         dialog.exec()
-        new_db = settings.value("db_path", "")
+        new_db = get_db_path()
         # Only re-run the (heavy, potentially dialog-popping) schema sync when the
         # database actually changed — not when just the module output path was edited.
         self.refresh_sidebar(do_sync=(old_db != new_db))
@@ -467,17 +467,73 @@ class MainWindow(QWidget):
         dialog.exec()
 
     def open_module_builder(self):
-        db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
-        dialog = ModuleBuilderDialog(db_path, self)
+        dialog = ModuleBuilderDialog(get_db_path(), self)
         dialog.exec()
         self.refresh_module_sidebar()
         
     def open_module_api(self):
         QMessageBox.information(self, "Module API", "Documentation coming soon...\n\nCurrently available built-in functions:\n\nget_objects(class_name)\n-> Returns a complete Pandas DataFrame of the specified class, including automatically resolved multi-title relationships.")
 
+    def warn_if_wal_on_network(self, db_path):
+        """Flag the one combination SQLite does not support: WAL on a network share.
+
+        init_db switches network-hosted databases to the rollback journal, but that
+        only takes effect when no other connection holds the file. If a colleague
+        still has the app open, the switch silently does nothing and everyone stays
+        in the unsupported mode — so say so rather than leave it invisible.
+        """
+        if getattr(self, "_warned_wal_on_network", False):
+            return
+        if not is_network_path(db_path) or journal_mode(db_path) != "wal":
+            return
+        self._warned_wal_on_network = True
+        QMessageBox.warning(self, "Network Database Warning",
+            "This database is on a network location and is still using WAL mode, which "
+            "SQLite does not support over a network.\n\n"
+            "While it stays in this mode, other PCs may be locked out and there is a risk "
+            "to the data.\n\n"
+            "It could not be switched automatically because another connection is holding "
+            "the file. Ask everyone to close Nexus, then reopen it — the switch happens on "
+            "startup and only needs to succeed once.")
+
+    def backup_now(self):
+        """Write a verified snapshot of the database, safe to run while it is in use."""
+        db_path = get_db_path()
+        if not db_path or not os.path.exists(db_path):
+            QMessageBox.warning(self, "Backup", "There is no database to back up yet.")
+            return
+
+        stem = os.path.splitext(os.path.basename(db_path))[0]
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        suggested = os.path.join(os.path.dirname(db_path), f"{stem}_backup_{stamp}.db")
+
+        dest, _ = QFileDialog.getSaveFileName(self, "Save Database Backup", suggested, "SQLite DB (*.db)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".db"):
+            dest += ".db"
+
+        ok, result = backup_database(db_path, dest)
+        if not ok:
+            QMessageBox.critical(self, "Backup Failed",
+                f"No backup was written, and any previous backup at that name is untouched.\n\n{result}")
+            return
+
+        # A database backup alone is incomplete when 'file' attributes are in use —
+        # the attachments live outside it, in the per-database files folder.
+        files_dir = files_dir_for(db_path, create=False)
+        note = ""
+        if files_dir and os.path.isdir(files_dir):
+            note = ("\n\nAttachments are stored separately in:\n"
+                    f"{files_dir}\n"
+                    "Copy that folder as well for a complete backup.")
+
+        QMessageBox.information(self, "Backup Complete",
+            f"Verified snapshot written to:\n{result}\n\nIntegrity check passed.{note}")
+
     def clean_unused_files(self):
         """Move any file in the storage folder that no record references into _trash."""
-        db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+        db_path = get_db_path()
         files_dir = files_dir_for(db_path, create=False)
         if not files_dir or not os.path.isdir(files_dir):
             QMessageBox.information(self, "Clean Up", "There is no files folder yet — nothing to clean.")
@@ -485,7 +541,7 @@ class MainWindow(QWidget):
 
         referenced = set()
         try:
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("""
                     SELECT c.name, a.name FROM attributes a
@@ -517,7 +573,7 @@ class MainWindow(QWidget):
             f"Moved {moved} unused file(s) to the _trash folder inside:\n{files_dir}")
 
     def sync_all_classes(self, db_path):
-        with sqlite3.connect(db_path) as conn:
+        with db_session(db_path) as conn:
             cur = conn.cursor()
             
             try:
@@ -590,8 +646,13 @@ class MainWindow(QWidget):
         if QSqlDatabase.contains(): db = QSqlDatabase.database()
         else: db = QSqlDatabase.addDatabase("QSQLITE")
 
+        # The Qt connection needs the same lock patience as the sqlite3 ones, or the
+        # table view fails instantly on a lock the writer clears a moment later.
+        db.setConnectOptions(f"QSQLITE_BUSY_TIMEOUT={BUSY_TIMEOUT_MS}")
         db.setDatabaseName(db_path)
         if not db.open(): return
+
+        self.warn_if_wal_on_network(db_path)
 
         if do_sync:
             # Drop any read lock the data view holds before sync_all_classes runs DDL,
@@ -600,7 +661,7 @@ class MainWindow(QWidget):
             self.sync_all_classes(db_path)
 
         try:
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
                 root_items = {}
@@ -640,12 +701,11 @@ class MainWindow(QWidget):
 
     def refresh_module_sidebar(self):
         self.module_sidebar.clear()
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        db_path = settings.value("db_path", "")
+        db_path = get_db_path()
         if not db_path or not os.path.exists(db_path): return
         
         try:
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT id, name, path FROM modules ORDER BY path ASC, name ASC")
                 root_items = {}
@@ -701,10 +761,9 @@ class MainWindow(QWidget):
             self.open_module_builder()
 
     def run_module_by_id(self, mid):
-        settings = QSettings("MyCompany", "DatabaseManagerApp")
-        db_path = settings.value("db_path", "")
-        
-        with sqlite3.connect(db_path) as conn:
+        db_path = get_db_path()
+
+        with db_session(db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT name, code FROM modules WHERE id = ?", (mid,))
             row = cur.fetchone()
@@ -714,11 +773,11 @@ class MainWindow(QWidget):
             return
             
         mname, code = row
-        out_path = settings.value("module_output_path", os.path.join(os.path.expanduser("~"), "module_output.txt"))
+        out_path = get_module_output_path()
         
         def local_get_objects(class_name):
             if pd is None: raise ImportError("Pandas library is not installed.")
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT id FROM classes WHERE name = ?", (class_name,))
                 r = cur.fetchone()
@@ -733,7 +792,7 @@ class MainWindow(QWidget):
             if not view_name: raise RuntimeError(f"Failed to sync schema for '{class_name}'.")
                 
             full_view_name = f"full_view_{safe_table_name}"
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 df = pd.read_sql_query(f"SELECT * FROM {qid(full_view_name)}", conn)
             return df
             

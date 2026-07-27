@@ -8,13 +8,14 @@ import sys
 import os
 import re
 import ast
+import json
 import uuid
 import shutil
 import sqlite3
 import datetime
+from contextlib import contextmanager
 
 from PySide6.QtGui import QIcon
-from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QMessageBox
 
 
@@ -30,24 +31,171 @@ def app_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+DEFAULT_DB_FILENAME = "nexus.db"
+DEFAULT_MODULE_OUTPUT_FILENAME = "module_output.txt"
+
+
 def default_db_path():
     """Default database location: nexus.db next to the executable/script."""
-    return os.path.join(app_base_dir(), "nexus.db")
+    return os.path.join(app_base_dir(), DEFAULT_DB_FILENAME)
+
+
+# ==========================================
+# APPLICATION CONFIGURATION
+# ==========================================
+# Settings live in resources/nexus_config.json next to the app instead of the
+# Windows registry. A registry hive (HKEY_CURRENT_USER) is part of the user's
+# profile, and managed corporate machines routinely reset those — mandatory
+# profiles discard every change at logoff, a failed profile load hands out a
+# temporary one — which silently loses the configured database path. A plain
+# file next to the app survives that, and can be read, edited or pre-seeded by
+# hand when deploying.
+CONFIG_FILENAME = "nexus_config.json"
+DEFAULT_CONFIG = {
+    "db_path": DEFAULT_DB_FILENAME,
+    "module_output_path": DEFAULT_MODULE_OUTPUT_FILENAME,
+}
+
+
+def config_path():
+    """resources/nexus_config.json beside the executable (or this source file)."""
+    return os.path.join(app_base_dir(), "resources", CONFIG_FILENAME)
+
+
+def save_config(cfg):
+    """Write the config atomically: a crash mid-write must not truncate the file.
+
+    Returns True on success. A read-only install folder is not fatal — the app
+    keeps running on in-memory values rather than refusing to start.
+    """
+    path = config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, path)  # atomic on the same volume
+        return True
+    except OSError:
+        return False
+
+
+def load_config():
+    """Return the config dict, creating the file with defaults when it is absent.
+
+    Unknown keys in the file are preserved; missing ones fall back to DEFAULT_CONFIG.
+    A corrupt or unreadable file degrades to defaults instead of raising, so a bad
+    write can never stop the app from starting.
+    """
+    path = config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg = dict(DEFAULT_CONFIG)
+                cfg.update(data)
+                return cfg
+        except (OSError, ValueError):
+            pass
+        return dict(DEFAULT_CONFIG)
+
+    cfg = dict(DEFAULT_CONFIG)
+    save_config(cfg)
+    return cfg
+
+
+def get_config_value(key, default=""):
+    val = load_config().get(key, default)
+    return default if val is None else val
+
+
+def set_config_value(key, value):
+    cfg = load_config()
+    cfg[key] = value
+    return save_config(cfg)
+
+
+def resolve_app_path(stored):
+    """Turn a stored config path into the absolute path everything else works with.
+
+    A bare name or relative path is taken as relative to the app folder, so a
+    config holding just "nexus.db" keeps working when the whole install is moved
+    or copied to another machine. Absolute paths (another drive, a network share
+    picked via Browse) are used unchanged.
+    """
+    if not stored:
+        return ""
+    stored = str(stored).strip()
+    if os.path.isabs(stored):
+        return stored
+    return os.path.normpath(os.path.join(app_base_dir(), stored))
+
+
+def storable_app_path(path):
+    """The form of an absolute path to write into the config.
+
+    Paths inside the app folder are stored by their relative name so the config
+    stays portable and readable; anything outside it keeps a full path.
+    """
+    if not path:
+        return ""
+    path = str(path).strip()
+    if not os.path.isabs(path):
+        return path
+    try:
+        base = app_base_dir()
+        if os.path.splitdrive(path)[0].lower() != os.path.splitdrive(base)[0].lower():
+            return path  # different drive: no relative form exists
+        rel = os.path.relpath(path, base)
+    except ValueError:
+        return path
+    if rel.startswith(".."):
+        return path  # outside the app folder
+    return rel.replace("\\", "/")
 
 
 def get_db_path():
     """The single active database path shared by every entry point.
 
     Returns the user's saved choice (Settings dialog), or the default next to the
-    app on first run — persisting it. Centralising this stops the main window and
-    the builder dialogs from silently diverging onto different database files.
+    app on first run — persisting it. Always absolute, so callers such as
+    files_dir_for never have to resolve it against the working directory.
+    Centralising this stops the main window and the builder dialogs from silently
+    diverging onto different database files.
     """
-    settings = QSettings("MyCompany", "DatabaseManagerApp")
-    path = (settings.value("db_path", "") or "").strip()
-    if not path:
-        path = default_db_path()
-        settings.setValue("db_path", path)
-    return path
+    cfg = load_config()
+    stored = (cfg.get("db_path") or "").strip()
+    if not stored:
+        stored = DEFAULT_DB_FILENAME
+        cfg["db_path"] = stored
+        save_config(cfg)
+    return resolve_app_path(stored)
+
+
+def set_db_path(path):
+    """Persist the active database, relativising it when it sits beside the app."""
+    return set_config_value("db_path", storable_app_path(path))
+
+
+def get_module_output_path():
+    """Where module scripts append their output — the counterpart of get_db_path.
+
+    Always absolute, and resolved from one place so the Settings dialog can never
+    display a different destination than the one a module run actually writes to.
+    """
+    cfg = load_config()
+    stored = (cfg.get("module_output_path") or "").strip()
+    if not stored:
+        stored = DEFAULT_MODULE_OUTPUT_FILENAME
+        cfg["module_output_path"] = stored
+        save_config(cfg)
+    return resolve_app_path(stored)
+
+
+def set_module_output_path(path):
+    """Persist the module output file, relativising it when it sits beside the app."""
+    return set_config_value("module_output_path", storable_app_path(path))
 
 
 def get_app_icon():
@@ -216,8 +364,123 @@ def trash_stored_file(db_path, stored_value):
 
 
 # ==========================================
+# DATABASE CONNECTIONS
+# ==========================================
+# How long a statement waits for a lock held by someone else before giving up.
+# Without it SQLite fails instantly on contention, which on a shared database turns
+# a harmless overlap into a visible error; waiting a few seconds resolves almost all
+# of them. It is a per-connection setting, hence db_session below.
+BUSY_TIMEOUT_MS = 5000
+
+
+def is_network_path(path):
+    """True when the path lives on a UNC share or a mapped network drive."""
+    if not path:
+        return False
+    p = os.path.abspath(str(path))
+    if p.startswith("\\\\") or p.startswith("//"):
+        return True
+    if os.name == "nt":
+        drive = os.path.splitdrive(p)[0]
+        if drive:
+            try:
+                import ctypes
+                DRIVE_REMOTE = 4
+                return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
+            except Exception:
+                return False
+    return False
+
+
+@contextmanager
+def db_session(db_path, **kwargs):
+    """Open a connection that commits on success, rolls back on error, and closes.
+
+    Drop-in for `with sqlite3.connect(path) as conn:` — the inner `with conn:` keeps
+    exactly the same commit/rollback semantics — but it also applies busy_timeout and,
+    crucially, closes the connection afterwards. sqlite3's own context manager does
+    not close, so connections used to survive until garbage collection; on a shared
+    database that keeps the file (and in WAL mode its -wal/-shm) open far longer than
+    the work actually needs.
+    """
+    conn = sqlite3.connect(db_path, **kwargs)
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def journal_mode(db_path):
+    """The journal mode currently recorded in the database file ('wal', 'delete', …)."""
+    try:
+        with db_session(db_path) as conn:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            return (row[0] if row else "").lower()
+    except sqlite3.Error:
+        return ""
+
+
+# ==========================================
 # DATABASE BOOTSTRAP
 # ==========================================
+def backup_database(db_path, dest_path):
+    """Write a verified, consistent snapshot of the database to dest_path.
+
+    Uses VACUUM INTO, which runs inside SQLite's own read transaction, so the copy
+    is safe even while the database is open and being written to from elsewhere.
+    Copying the file by hand cannot promise that: it can catch a half-written page
+    and produce a silently broken backup, and it misses anything still sitting in
+    the -wal. The result here is a single clean file with no -wal/-shm beside it.
+
+    The snapshot is written to a temporary name and only moved into place after
+    PRAGMA integrity_check passes, so a failed or corrupt run can never destroy a
+    previous good backup. Returns (ok, dest_path_or_error_message).
+    """
+    # sqlite3.connect() CREATES a database when the path is missing, which would
+    # otherwise produce a valid-but-empty snapshot that passes integrity_check and
+    # replaces a perfectly good previous backup. Refuse before touching anything.
+    if not db_path or not os.path.isfile(db_path):
+        return False, f"The source database does not exist:\n{db_path}"
+    if os.path.abspath(dest_path) == os.path.abspath(db_path):
+        return False, "The backup destination is the live database itself."
+
+    tmp = dest_path + ".part"
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+        # Connections are closed explicitly: Windows cannot replace a file that is
+        # still open, and VACUUM INTO must not run inside a transaction.
+        src = sqlite3.connect(db_path, isolation_level=None)
+        try:
+            src.execute("VACUUM INTO ?", (tmp,))
+        finally:
+            src.close()
+
+        chk = sqlite3.connect(tmp)
+        try:
+            verdict = chk.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            chk.close()
+
+        if verdict != "ok":
+            os.remove(tmp)
+            return False, ("The snapshot failed its integrity check, which means the source "
+                           f"database is already damaged:\n\n{verdict}")
+
+        os.replace(tmp, dest_path)
+        return True, dest_path
+    except (sqlite3.Error, OSError) as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+
+
 def _ensure_column(conn, table, column, decl):
     """Add a column if the table lacks it — idempotent, non-destructive migration.
 
@@ -232,11 +495,21 @@ def _ensure_column(conn, table, column, decl):
 def init_db(db_path=None):
     if db_path is None:
         db_path = default_db_path()
-    with sqlite3.connect(db_path) as conn:
-        # WAL lets readers (the Qt table view) and the writer (sqlite3 DDL/DML)
-        # work on the same file concurrently without "database is locked" errors.
-        # This is a persistent property of the file, so setting it once is enough.
-        conn.execute("PRAGMA journal_mode=WAL")
+    with db_session(db_path) as conn:
+        # Locally, WAL lets readers (the Qt table view) and the writer (sqlite3
+        # DDL/DML) work on the same file concurrently without "database is locked".
+        #
+        # On a network share it must NOT be used: WAL coordinates readers and writers
+        # through shared memory (the -shm file), which requires every connection to be
+        # on the same machine. Over SMB that guarantee does not hold — the symptoms are
+        # a second PC being locked out entirely, and the risk is corruption. The classic
+        # rollback journal needs no shared memory, so network-hosted databases use it.
+        #
+        # Journal mode is a persistent property of the file. Re-applying it on each
+        # start is cheap and self-correcting: a database that could not be switched
+        # (because another connection still held it) is switched on a later run.
+        # Only runtime behaviour changes — the file stays an ordinary SQLite database.
+        conn.execute("PRAGMA journal_mode=" + ("DELETE" if is_network_path(db_path) else "WAL"))
         conn.execute("PRAGMA foreign_keys = 1")
         cursor = conn.cursor()
         cursor.executescript("""
@@ -327,10 +600,31 @@ def safe_convert(val, app_type):
         return False, None
 
 
+def _ensure_view(cur, name, sql):
+    """Create a view only when its definition differs from the one already stored.
+
+    sqlite_master keeps the CREATE statement verbatim, so comparing it against the
+    text we would generate says exactly whether anything changed. That matters
+    because sync_physical_table runs on every class selection: unconditionally
+    dropping and recreating the three views turned every click into six DDL writes,
+    which on a shared database file means a write lock per navigation.
+
+    Comparing against reality rather than a cached fingerprint also self-heals — a
+    missing view (dropped by the table-rebuild path, or by a run that crashed) has
+    no row here, so it is recreated. Returns True when the view was rewritten.
+    """
+    row = cur.execute("SELECT sql FROM sqlite_master WHERE type='view' AND name=?", (name,)).fetchone()
+    if row and row[0] == sql:
+        return False
+    cur.execute(f"DROP VIEW IF EXISTS {qid(name)}")
+    cur.execute(sql)
+    return True
+
+
 def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
     safe_table_name = f"objects_{sanitize_name(class_name)}"
 
-    with sqlite3.connect(db_path) as conn:
+    with db_session(db_path) as conn:
         cur = conn.cursor()
 
         cur.execute("SELECT name, data_type, show_in_table, is_title, lookup_query, is_unique, is_required FROM attributes WHERE class_id = ? ORDER BY row_order", (class_id,))
@@ -378,8 +672,10 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
             existing_cols = {row[1]: row[2] for row in info_rows}
             existing_notnull = {row[1]: row[3] for row in info_rows}
 
-            cur.execute(f"SELECT COUNT(*) FROM {qid(safe_table_name)}")
-            table_has_rows = cur.fetchone()[0] > 0
+            # Only the yes/no answer is used below, so stop at the first row instead of
+            # scanning the whole table on every sync (this runs on every class click).
+            cur.execute(f"SELECT 1 FROM {qid(safe_table_name)} LIMIT 1")
+            table_has_rows = cur.fetchone() is not None
 
             type_mismatches = []
             for col_name, sql_type in required_cols:
@@ -589,8 +885,8 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 base_selects.append(f"m.{qid(safe_col_name)} AS {qid(attr_name)}")
 
         base_view_name = f"base_view_{safe_table_name}"
-        cur.execute(f"DROP VIEW IF EXISTS {qid(base_view_name)}")
-        cur.execute(f"CREATE VIEW {qid(base_view_name)} AS SELECT {', '.join(base_selects)} FROM {qid(safe_table_name)} m")
+        _ensure_view(cur, base_view_name,
+                     f"CREATE VIEW {qid(base_view_name)} AS SELECT {', '.join(base_selects)} FROM {qid(safe_table_name)} m")
 
         ui_selects = ["v.[ID]"]
         full_selects = ["v.[ID]"]
@@ -639,11 +935,11 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                 full_selects.append(query_str)
 
         view_name = f"view_{safe_table_name}"
-        cur.execute(f"DROP VIEW IF EXISTS {qid(view_name)}")
-        cur.execute(f"CREATE VIEW {qid(view_name)} AS SELECT {', '.join(ui_selects)} FROM {qid(base_view_name)} v")
+        _ensure_view(cur, view_name,
+                     f"CREATE VIEW {qid(view_name)} AS SELECT {', '.join(ui_selects)} FROM {qid(base_view_name)} v")
 
         full_view_name = f"full_view_{safe_table_name}"
-        cur.execute(f"DROP VIEW IF EXISTS {qid(full_view_name)}")
-        cur.execute(f"CREATE VIEW {qid(full_view_name)} AS SELECT {', '.join(full_selects)} FROM {qid(base_view_name)} v")
+        _ensure_view(cur, full_view_name,
+                     f"CREATE VIEW {qid(full_view_name)} AS SELECT {', '.join(full_selects)} FROM {qid(base_view_name)} v")
 
     return view_name, safe_table_name

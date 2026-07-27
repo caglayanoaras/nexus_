@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from core import (
-    get_app_icon, get_db_path, init_db, sanitize_name, qid,
+    get_app_icon, get_db_path, init_db, sanitize_name, qid, db_session,
     storage_class_for, coerce_value_for_type, trash_stored_file,
 )
 
@@ -319,7 +319,7 @@ class DiscreteTypeBuilderDialog(QDialog):
 
     def refresh_type_list(self):
         self.type_list.clear()
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             for tid, tname in conn.execute("SELECT id, name FROM discrete_types ORDER BY name ASC").fetchall():
                 item = QListWidgetItem(tname)
                 item.setIcon(qta.icon('fa5s.list-ul', color='#9C27B0'))
@@ -346,7 +346,7 @@ class DiscreteTypeBuilderDialog(QDialog):
         self.current_type_id = tid
         self.editor_widget.setEnabled(True)
         self.clear_options()
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             row = conn.execute("SELECT name FROM discrete_types WHERE id = ?", (tid,)).fetchone()
             if not row:
                 self.refresh_type_list()
@@ -392,7 +392,7 @@ class DiscreteTypeBuilderDialog(QDialog):
             return
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
                 cur = conn.cursor()
 
@@ -474,7 +474,7 @@ class DiscreteTypeBuilderDialog(QDialog):
     def delete_type(self):
         if self.current_type_id is None:
             return
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             refs = conn.execute(
                 "SELECT c.name, a.name FROM attributes a JOIN classes c ON a.class_id = c.id "
                 "WHERE a.data_type = 'discrete' AND a.lookup_query = ?", (str(self.current_type_id),)).fetchall()
@@ -486,7 +486,7 @@ class DiscreteTypeBuilderDialog(QDialog):
 
         reply = QMessageBox.question(self, "Delete", "Delete this discrete type and its options?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
                 conn.execute("DELETE FROM discrete_types WHERE id = ?", (self.current_type_id,))
                 conn.commit()
@@ -593,7 +593,7 @@ class ClassBuilderDialog(QDialog):
         
     def get_all_classes(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT id, name, path FROM classes ORDER BY path ASC, name ASC")
                 return cur.fetchall()
@@ -604,7 +604,7 @@ class ClassBuilderDialog(QDialog):
 
     def get_all_lookups(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("""
                     SELECT c.name, a.name 
@@ -620,7 +620,7 @@ class ClassBuilderDialog(QDialog):
 
     def get_all_discrete_types(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT id, name FROM discrete_types ORDER BY name ASC")
                 return cur.fetchall()
@@ -686,7 +686,7 @@ class ClassBuilderDialog(QDialog):
         self.clear_layout(self.attributes_layout)
         self.clear_layout(self.relationships_layout)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT name, path FROM classes WHERE id = ?", (self.current_class_id,))
             row = cur.fetchone()
@@ -730,7 +730,7 @@ class ClassBuilderDialog(QDialog):
                 self.relationships_layout.addWidget(RelationshipRow(self.relationships_layout, valid_classes, {'id': rel_id, 'target_class': target, 'type': rel_type, 'show_in_base': show_in_base, 'show_in_target': show_in_target, 'is_required': is_required}))
 
     def check_for_circular_dependencies(self, new_class_name):
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute("SELECT id, name FROM classes")
             classes = {row[0]: row[1] for row in cur.fetchall()}
@@ -780,7 +780,7 @@ class ClassBuilderDialog(QDialog):
 
         safe_class_name = sanitize_name(name)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             try:
                 cur.execute("SELECT id, name FROM classes")
@@ -858,7 +858,7 @@ class ClassBuilderDialog(QDialog):
                     return
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
                 cur = conn.cursor()
                 
@@ -1084,7 +1084,7 @@ class ClassBuilderDialog(QDialog):
         if reply != QMessageBox.Yes:
             return
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 cid = self.current_class_id
 

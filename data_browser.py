@@ -14,12 +14,13 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QFileDialog, QListWidget, QListWidgetItem, QCheckBox,
     QGroupBox, QRadioButton, QDialogButtonBox, QTextBrowser,
 )
-from PySide6.QtCore import Qt, QSettings, QDateTime, QRegularExpression, QUrl
+from PySide6.QtCore import Qt, QDateTime, QRegularExpression, QUrl
 from PySide6.QtSql import QSqlDatabase, QSqlQueryModel, QSqlQuery
 from PySide6.QtGui import QRegularExpressionValidator, QDesktopServices
 
 from core import (
-    sync_physical_table, safe_convert, sanitize_name, qid, FILE_PREFIX_LEN,
+    get_app_icon, get_db_path, sync_physical_table, safe_convert, sanitize_name, qid, FILE_PREFIX_LEN,
+    db_session,
     files_dir_for, make_stored_filename, display_file_name,
     resolve_file_path, trash_stored_file,
 )
@@ -206,7 +207,7 @@ class ColumnFilterDialog(QDialog):
         """Return (values, truncated). Discrete options are merged in even if unused."""
         rows = []
         try:
-            with sqlite3.connect(db_path) as conn:
+            with db_session(db_path) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     f"SELECT DISTINCT {qid(col_display)} FROM {qid(view_name)} "
@@ -512,7 +513,7 @@ class DataBrowserPage(QWidget):
         self.btn_edit.setEnabled(False)
         self.btn_delete.setEnabled(False)
         
-        self.db_path = QSettings("MyCompany", "DatabaseManagerApp").value("db_path", "")
+        self.db_path = get_db_path()
 
         # Release any read lock the Qt view holds on the old class's view before the
         # schema sync runs DDL on this database file (belt-and-suspenders alongside WAL).
@@ -524,7 +525,7 @@ class DataBrowserPage(QWidget):
             if not self.current_view_name:
                 raise RuntimeError("Sync aborted or failed to generate a valid view.")
                 
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 cur = conn.cursor()
                 cur.execute(f"PRAGMA table_info({qid(self.current_view_name)})")
                 columns = [row[1] for row in cur.fetchall()]
@@ -936,7 +937,7 @@ class DataBrowserPage(QWidget):
     def build_and_exec_query(self):
         if not self.current_view_name: return
         
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
 
             base_query = f"FROM {qid(self.current_view_name)}"
@@ -964,6 +965,14 @@ class DataBrowserPage(QWidget):
                 QMessageBox.critical(self, "Database Query Error", f"An error occurred while fetching data from the view:\n\n{query.lastError().text()}")
                 
             self.query_model.setQuery(query)
+
+            # Qt fetches a query lazily (256 rows at a time) and keeps the statement -
+            # and with it a read lock - open until the last row is fetched. Under the
+            # rollback journal a network database uses, that read lock blocks every
+            # other user from saving for as long as this grid sits partially scrolled.
+            # The page is capped at page_size rows, so draining it now is bounded work.
+            while self.query_model.canFetchMore():
+                self.query_model.fetchMore()
             
             hidden_for_class = self.hidden_columns_memory.get(self.current_class_name, set())
             for i in range(self.query_model.columnCount()):
@@ -1094,7 +1103,7 @@ class DataBrowserPage(QWidget):
         obj_id = self.query_model.data(id_index)
         if not obj_id:
             return
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             row = conn.execute(f"SELECT {qid(safe_col)} FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,)).fetchone()
         stored = row[0] if row else None
         if not stored:
@@ -1146,14 +1155,14 @@ class DataBrowserPage(QWidget):
                 # Collect attached files first so we can retire them after a successful delete.
                 stored_files = []
                 if self.file_columns:
-                    with sqlite3.connect(self.db_path) as conn:
+                    with db_session(self.db_path) as conn:
                         cols = list(self.file_columns.values())
                         sel = ", ".join(qid(c) for c in cols)
                         r = conn.execute(f"SELECT {sel} FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,)).fetchone()
                         if r:
                             stored_files = [v for v in r if v]
 
-                with sqlite3.connect(self.db_path) as conn:
+                with db_session(self.db_path) as conn:
                     conn.execute("PRAGMA foreign_keys = 1")
                     conn.execute("BEGIN IMMEDIATE")
                     conn.execute(f"DELETE FROM {qid(self.current_table_name)} WHERE id = ?", (obj_id,))
@@ -1221,7 +1230,7 @@ class DataBrowserPage(QWidget):
 
     def _gather_export_rows(self, opts):
         """Return (headers, rows) for the chosen export options."""
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
 
             if opts['import_ready']:
@@ -1355,7 +1364,7 @@ class DataBrowserPage(QWidget):
             QMessageBox.warning(self, "Import", "The file appears to be empty.")
             return
 
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             attrs, rels, lookthrough_names = self._get_import_schema(conn.cursor())
 
         analysis = self._analyze_import(all_rows, attrs, rels, lookthrough_names)
@@ -1374,7 +1383,7 @@ class DataBrowserPage(QWidget):
         copied_abs = []     # files copied into storage this run (deleted on failure)
         old_to_trash = []   # replaced file references to retire after a successful commit
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
                 cur = conn.cursor()
 

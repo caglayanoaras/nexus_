@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, QDateTime, QRegularExpression, QUrl
 from PySide6.QtGui import QRegularExpressionValidator, QDesktopServices
 
 from core import (
-    get_app_icon, sanitize_name, qid,
+    get_app_icon, sanitize_name, qid, db_session,
     files_dir_for, make_stored_filename, display_file_name,
     resolve_file_path, trash_stored_file,
 )
@@ -303,7 +303,7 @@ class ObjectEditorDialog(QDialog):
         form_layout.setContentsMargins(10, 10, 10, 10)
         form_layout.setSpacing(15)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with db_session(self.db_path) as conn:
             cur = conn.cursor()
             
             cur.execute("SELECT id, name, data_type, is_unique, is_required, lookup_query FROM attributes WHERE class_id = ? ORDER BY row_order", (self.class_id,))
@@ -539,7 +539,7 @@ class ObjectEditorDialog(QDialog):
 
     def save_record(self):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with db_session(self.db_path) as conn:
                 conn.execute("PRAGMA foreign_keys = 1")
                 cur = conn.cursor()
                 
