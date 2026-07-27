@@ -1255,8 +1255,16 @@ class DataBrowserPage(QWidget):
                     ids = [r[0] for r in cur.fetchall()]
                     if not ids:
                         return headers, []
-                    sql += f" WHERE m.id IN ({', '.join(['?'] * len(ids))})"
-                    params = ids
+                    # The IDs go through a TEMP table rather than one bound parameter
+                    # each: SQLite caps parameters per statement (SQLITE_LIMIT_VARIABLE_NUMBER,
+                    # 32766 in the bundled build), so "IN (?,?,...)" fails with
+                    # 'too many SQL variables' once a filter matches more rows than that.
+                    # TEMP tables live in this connection's private temp store, not the
+                    # shared database file, so this takes no write lock for other users.
+                    cur.execute("CREATE TEMP TABLE IF NOT EXISTS export_ids (id INTEGER PRIMARY KEY)")
+                    cur.execute("DELETE FROM export_ids")
+                    cur.executemany("INSERT INTO export_ids (id) VALUES (?)", ((i,) for i in ids))
+                    sql += " WHERE m.id IN (SELECT id FROM export_ids)"
                 sql += " ORDER BY m.id ASC"
                 cur.execute(sql, params)
                 raw = cur.fetchall()

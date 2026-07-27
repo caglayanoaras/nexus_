@@ -453,13 +453,16 @@ def backup_database(db_path, dest_path):
 
         # Connections are closed explicitly: Windows cannot replace a file that is
         # still open, and VACUUM INTO must not run inside a transaction.
-        src = sqlite3.connect(db_path, isolation_level=None)
+        # The busy timeout matters here more than anywhere: this backup exists to run
+        # while the database is in use, so hitting another user's write lock must mean
+        # "wait a few seconds", not an instant 'database is locked' failure.
+        src = sqlite3.connect(db_path, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000.0)
         try:
             src.execute("VACUUM INTO ?", (tmp,))
         finally:
             src.close()
 
-        chk = sqlite3.connect(tmp)
+        chk = sqlite3.connect(tmp, timeout=BUSY_TIMEOUT_MS / 1000.0)
         try:
             verdict = chk.execute("PRAGMA integrity_check").fetchone()[0]
         finally:
@@ -698,7 +701,12 @@ def sync_physical_table(db_path, class_id, class_name, parent_widget=None):
                     elif col_name in type_mismatches:
                         # Conversion may null out incompatible values.
                         want = False
-                    elif table_has_rows:
+                    elif table_has_rows and not existing_notnull.get(col_name, 0):
+                        # Probe for NULLs only when tightening a currently-nullable column.
+                        # A column already NOT NULL cannot contain NULLs, and for it this
+                        # probe is a full table scan (no NULL is ever found) — repeated on
+                        # every class click, which over a network share is a real cost.
+                        # A nullable column with NULLs stops at the first NULL row: cheap.
                         cur.execute(f"SELECT 1 FROM {qid(safe_table_name)} WHERE {qid(col_name)} IS NULL LIMIT 1")
                         if cur.fetchone(): want = False
                 desired_notnull[col_name] = want
